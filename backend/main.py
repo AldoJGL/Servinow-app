@@ -1,72 +1,119 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from jose import jwt
 
-# 1. Configurar el motor de encriptación
+# 1. Configuración de Supabase
+SUPABASE_URL = "https://gruuoelmqzvjwdcluudz.supabase.co"  # Mantén tus credenciales anteriores
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdydXVvZWxtcXp2andkY2x1dWR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxOTA1MjIsImV4cCI6MjEwMzc2NjUyMn0.DhV3qJAdYIc5Pt7xzx3qICeFa42F-lXAEuyHSS7o7Jo"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# 2. Configuración de Seguridad (JWT y Passlib)
+SECRET_KEY = "super-clave-secreta-de-servinow-cambiar-en-produccion"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
-# 2. Conexión a Supabase (¡Pon tus credenciales reales aquí!)
-url = "https://gruuoelmqzvjwdcluudz.supabase.co"
-key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdydXVvZWxtcXp2andkY2x1dWR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxOTA1MjIsImV4cCI6MjEwMzc2NjUyMn0.DhV3qJAdYIc5Pt7xzx3qICeFa42F-lXAEuyHSS7o7Jo"
-supabase: Client = create_client(url, key)
+# 3. Configuración de CORS para permitir conexiones desde Flutter Web
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# 3. Modelos de datos
-class UsuarioNuevo(BaseModel):
+# --- MODELOS PYDANTIC ---
+class RegistroUsuario(BaseModel):
     nombre: str
-    correo: str
+    correo: EmailStr
     telefono: str
-    contrasena: str  # El usuario envía su contraseña normal
+    contrasena: str
     rol: str
 
-class UsuarioLogin(BaseModel):
-    correo: str
+class LoginUsuario(BaseModel):
+    correo: EmailStr
     contrasena: str
 
-# 4. Endpoint de Registro Seguro
+# --- FUNCIONES AUXILIARES ---
+def verificar_contrasena(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def obtener_password_hash(password):
+    return pwd_context.hash(password)
+
+def crear_token_acceso(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- ENDPOINTS ---
 @app.post("/registro")
-def registrar_usuario(usuario: UsuarioNuevo):
-    # Generar el hash (texto encriptado) de la contraseña
-    hash_generado = pwd_context.hash(usuario.contrasena)
-    
-    datos_insertar = {
-        "nombre": usuario.nombre,
-        "correo": usuario.correo,
-        "telefono": usuario.telefono,
-        "contrasena_hash": hash_generado,
-        "rol": usuario.rol
-    }
-    
+def registrar_usuario(usuario: RegistroUsuario):
     try:
-        respuesta = supabase.table("usuarios").insert(datos_insertar).execute()
-        return {"mensaje": "Usuario creado exitosamente", "id": respuesta.data[0]["id_usuario"]}
+        # Verificar si el correo ya existe
+        existing_user = supabase.table("usuarios").select("*").eq("correo", usuario.correo).execute()
+        if existing_user.data:
+            raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado")
+
+        hashed_password = obtener_password_hash(usuario.contrasena)
+        
+        nuevo_usuario = {
+            "nombre": usuario.nombre,
+            "correo": usuario.correo,
+            "telefono": usuario.telefono,
+            "contrasena_hash": hashed_password,
+            "rol": usuario.rol
+        }
+
+        response = supabase.table("usuarios").insert(nuevo_usuario).execute()
+        
+        return {"mensaje": "Usuario registrado exitosamente", "usuario": response.data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al registrar: {str(e)}")
 
-# 5. Nuevo Endpoint de Login
 @app.post("/login")
-def iniciar_sesion(credenciales: UsuarioLogin):
-    # Buscar si existe un registro con ese correo
-    respuesta = supabase.table("usuarios").select("*").eq("correo", credenciales.correo).execute()
-    
-    # Si la lista de datos viene vacía, el correo no existe
-    if not respuesta.data:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+def iniciar_sesion(usuario: LoginUsuario):
+    try:
+        # Buscar usuario por correo
+        response = supabase.table("usuarios").select("*").eq("correo", usuario.correo).execute()
         
-    usuario_db = respuesta.data[0]
-    
-    # Verificar si la contraseña ingresada coincide con el hash guardado
-    contrasena_valida = pwd_context.verify(credenciales.contrasena, usuario_db["contrasena_hash"])
-    
-    if not contrasena_valida:
-        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
-        
-    return {
-        "mensaje": "Login exitoso", 
-        "usuario": {
-            "nombre": usuario_db["nombre"], 
-            "rol": usuario_db["rol"]
+        if not response.data:
+            raise HTTPException(status_code=400, detail="Correo o contraseña incorrectos")
+
+        user_db = response.data[0]
+
+        # Verificar contraseña encriptada
+        if not verificar_contrasena(usuario.contrasena, user_db["contrasena_hash"]):
+            raise HTTPException(status_code=400, detail="Correo o contraseña incorrectos")
+
+        # Generar el Token JWT de acceso
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = crear_token_acceso(
+            data={"sub": user_db["correo"], "rol": user_db["rol"]}, expires_delta=access_token_expires
+        )
+
+        return {
+            "mensaje": "Login exitoso",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "usuario": {
+                "nombre": user_db["nombre"],
+                "rol": user_db["rol"]
+            }
         }
-    }
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Error en el servidor: {str(e)}")
