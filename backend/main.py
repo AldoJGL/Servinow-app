@@ -5,6 +5,8 @@ from supabase import create_client, Client
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt
+import math
+from typing import Optional
 
 # 1. Configuración de Supabase
 SUPABASE_URL = "https://gruuoelmqzvjwdcluudz.supabase.co"  # Mantén tus credenciales anteriores
@@ -62,7 +64,7 @@ def crear_token_acceso(data: dict, expires_delta: timedelta | None = None):
 @app.post("/registro")
 def registrar_usuario(usuario: RegistroUsuario):
     try:
-        # Verificar si el correo ya existe
+        # 1. Verificar si el correo ya existe
         existing_user = supabase.table("usuarios").select("*").eq("correo", usuario.correo).execute()
         if existing_user.data:
             raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado")
@@ -77,9 +79,20 @@ def registrar_usuario(usuario: RegistroUsuario):
             "rol": usuario.rol
         }
 
+        # 2. Insertar en la tabla usuarios
         response = supabase.table("usuarios").insert(nuevo_usuario).execute()
+        usuario_creado = response.data[0]
         
-        return {"mensaje": "Usuario registrado exitosamente", "usuario": response.data}
+        # 3. Si el rol es Profesional, inicializamos su registro en la tabla 'profesionales'
+        if usuario.rol == 'Profesional':
+            nuevo_profesional = {
+                "id_usuario": usuario_creado["id_usuario"], # <-- Usamos el nombre exacto de la columna PK
+                "oficio": "Sin definir",            
+                "experiencia_anios": 0
+            }
+            supabase.table("profesionales").insert(nuevo_profesional).execute()
+        
+        return {"mensaje": "Usuario registrado exitosamente", "usuario": usuario_creado}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al registrar: {str(e)}")
 
@@ -117,3 +130,36 @@ def iniciar_sesion(usuario: LoginUsuario):
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=f"Error en el servidor: {str(e)}")
+
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    R = 6371.0 # Radio de la Tierra en kilómetros
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+@app.get("/profesionales/cercanos")
+def obtener_profesionales_cercanos(lat: float, lng: float, radio: float = 15.0, busqueda: Optional[str] = None):
+    try:
+        # Preparamos la consulta base
+        query = supabase.table("profesionales").select("id_profesional, oficio, latitud, longitud, usuarios(nombre, telefono)")
+        
+        # Si el cliente escribió algo en la barra, aplicamos el filtro de texto
+        if busqueda:
+            query = query.ilike("oficio", f"%{busqueda}%")
+            
+        response = query.execute()
+        
+        profesionales_cercanos = []
+        for prof in response.data:
+            if prof.get("latitud") and prof.get("longitud"):
+                distancia = calcular_distancia(lat, lng, prof["latitud"], prof["longitud"])
+                if distancia <= radio:
+                    prof["distancia_km"] = round(distancia, 2)
+                    profesionales_cercanos.append(prof)
+                    
+        profesionales_cercanos.sort(key=lambda x: x["distancia_km"])
+        return {"profesionales": profesionales_cercanos}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al buscar profesionales: {str(e)}")
