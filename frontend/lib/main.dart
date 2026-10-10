@@ -919,13 +919,127 @@ class EditarPerfilProfesionalScreen extends StatefulWidget {
 }
 
 class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalScreen> {
+  // Debe coincidir con OFICIOS_VALIDOS del backend (y con las palabras del buscador de clientes)
+  static const List<String> _oficios = [
+    'Plomero',
+    'Electricista',
+    'Carpintero',
+    'Cerrajero',
+    'Pintor',
+    'Técnico de clima',
+  ];
+  static const LatLng _centroPorDefecto = LatLng(25.7969, -100.2958); // Gral. Escobedo, N.L.
+
   final TextEditingController _descripcionController = TextEditingController();
   final ImagePicker _picker = ImagePicker();
-  
+  final MapController _mapController = MapController();
+
   XFile? _foto1;
   XFile? _foto2;
   XFile? _foto3;
+  String? _oficio;
+  LatLng? _ubicacion;
+  String _direccionTexto = '';
   bool _isLoading = false;
+  bool _cargandoPerfil = true;
+  bool _obteniendoGps = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _cargarPerfil();
+  }
+
+  @override
+  void dispose() {
+    _descripcionController.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  // Carga lo que el profesional ya tenía guardado (oficio, ubicación, descripción)
+  Future<void> _cargarPerfil() async {
+    try {
+      final res = await http.get(
+        Uri.parse('$kBaseUrl/profesionales/perfil'),
+        headers: {'Authorization': 'Bearer ${widget.token}'},
+      );
+      if (res.statusCode == 200) {
+        final p = jsonDecode(res.body)['profesional'];
+        final oficioGuardado = p['oficio']?.toString();
+        final lat = p['latitud'];
+        final lng = p['longitud'];
+        if (!mounted) return;
+        setState(() {
+          _descripcionController.text = (p['descripcion'] ?? '').toString();
+          if (oficioGuardado != null && _oficios.contains(oficioGuardado)) {
+            _oficio = oficioGuardado;
+          }
+          if (lat != null && lng != null) {
+            _ubicacion = LatLng((lat as num).toDouble(), (lng as num).toDouble());
+          }
+        });
+        if (_ubicacion != null) _actualizarDireccion(_ubicacion!);
+      }
+    } catch (e) {
+      debugPrint('Error al cargar perfil: $e');
+    } finally {
+      if (mounted) setState(() => _cargandoPerfil = false);
+    }
+  }
+
+  // Convierte coordenadas en una dirección legible (solo informativa)
+  Future<void> _actualizarDireccion(LatLng punto) async {
+    try {
+      final url = Uri.parse(
+          'https://nominatim.openstreetmap.org/reverse?format=json&lat=${punto.latitude}&lon=${punto.longitude}');
+      final res = await http.get(url, headers: {'User-Agent': 'ServinowApp/1.0 (contacto@servinow.com)'});
+      if (res.statusCode == 200) {
+        final address = jsonDecode(res.body)['address'] ?? {};
+        final calle = address['road'] ?? address['pedestrian'] ?? '';
+        final colonia = address['suburb'] ?? address['neighbourhood'] ?? '';
+        final ciudad = address['city'] ?? address['town'] ?? address['village'] ?? '';
+        final partes = [calle, colonia, ciudad].where((e) => e.toString().isNotEmpty).join(', ');
+        // Si el usuario ya movió el pin a otro lado, ignoramos esta respuesta vieja
+        if (mounted && _ubicacion == punto) setState(() => _direccionTexto = partes);
+      }
+    } catch (_) {}
+  }
+
+  void _fijarUbicacion(LatLng punto, {bool moverMapa = false}) {
+    setState(() {
+      _ubicacion = punto;
+      _direccionTexto = '';
+    });
+    if (moverMapa) _mapController.move(punto, 16);
+    _actualizarDireccion(punto);
+  }
+
+  Future<void> _usarMiUbicacion() async {
+    setState(() => _obteniendoGps = true);
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        if (mounted) _snack(context, 'Activa el GPS de tu dispositivo.', color: Colors.orange[800]!);
+        return;
+      }
+      var permiso = await Geolocator.checkPermission();
+      if (permiso == LocationPermission.denied) {
+        permiso = await Geolocator.requestPermission();
+      }
+      if (permiso == LocationPermission.denied || permiso == LocationPermission.deniedForever) {
+        if (mounted) _snack(context, 'Permiso de ubicación denegado. También puedes tocar el mapa para marcar tu casa.', color: Colors.orange[800]!);
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      _fijarUbicacion(LatLng(pos.latitude, pos.longitude), moverMapa: true);
+    } catch (e) {
+      if (mounted) _snack(context, 'No se pudo obtener tu ubicación: $e', color: Colors.orange[800]!);
+    } finally {
+      if (mounted) setState(() => _obteniendoGps = false);
+    }
+  }
 
   Future<void> _seleccionarImagen(int numeroFoto) async {
     final XFile? imagen = await _picker.pickImage(source: ImageSource.gallery, imageQuality: 80);
@@ -940,7 +1054,7 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
   Future<void> _adjuntarArchivo(http.MultipartRequest request, String fieldName, XFile? archivo) async {
     if (archivo == null) return;
-    
+
     final bytes = await archivo.readAsBytes();
     final extension = archivo.name.split('.').last.toLowerCase();
     final mimeType = (extension == 'png') ? 'png' : 'jpeg';
@@ -956,6 +1070,15 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
   }
 
   Future<void> _guardarPerfil() async {
+    if (_oficio == null) {
+      _snack(context, 'Selecciona a qué te dedicas.', color: Colors.orange[800]!);
+      return;
+    }
+    if (_ubicacion == null) {
+      _snack(context, 'Marca tu ubicación para que los clientes cercanos puedan encontrarte.', color: Colors.orange[800]!);
+      return;
+    }
+
     setState(() => _isLoading = true);
     try {
       var request = http.MultipartRequest(
@@ -965,6 +1088,9 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
       request.headers['Authorization'] = 'Bearer ${widget.token}';
       request.fields['descripcion'] = _descripcionController.text.trim();
+      request.fields['oficio'] = _oficio!;
+      request.fields['latitud'] = _ubicacion!.latitude.toString();
+      request.fields['longitud'] = _ubicacion!.longitude.toString();
 
       await _adjuntarArchivo(request, 'foto_1', _foto1);
       await _adjuntarArchivo(request, 'foto_2', _foto2);
@@ -975,12 +1101,12 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
       if (response.statusCode == 200) {
         if (mounted) {
-          _snack(context, 'Perfil e imágenes guardados con éxito', color: Colors.green);
+          _snack(context, 'Perfil guardado con éxito', color: Colors.green);
           Navigator.pop(context);
         }
       } else {
         if (mounted) {
-          _snack(context, 'Error (${response.statusCode}): ${response.body}', color: Colors.red);
+          _snack(context, 'Error (${response.statusCode}): ${_detalleError(response.body)}', color: Colors.red);
         }
       }
     } catch (e) {
@@ -1030,41 +1156,119 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
     );
   }
 
+  Widget _buildSelectorUbicacion() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 240,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: _ubicacion ?? _centroPorDefecto,
+                initialZoom: _ubicacion != null ? 16.0 : 12.0,
+                onTap: (tapPosition, punto) => _fijarUbicacion(punto),
+              ),
+              children: [
+                TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'com.example.servinow'),
+                if (_ubicacion != null)
+                  MarkerLayer(markers: [
+                    Marker(
+                      point: _ubicacion!,
+                      width: 50,
+                      height: 50,
+                      alignment: Alignment.topCenter,
+                      child: const Icon(Icons.location_on, color: kAccent, size: 44),
+                    ),
+                  ]),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _obteniendoGps ? null : _usarMiUbicacion,
+            icon: _obteniendoGps
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.my_location),
+            label: const Text('Usar mi ubicación actual'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          _ubicacion == null
+              ? 'Toca el mapa para marcar dónde vives.'
+              : (_direccionTexto.isEmpty ? 'Ubicación marcada.' : 'Ubicación marcada: $_direccionTexto'),
+          style: TextStyle(fontSize: 12, color: _ubicacion == null ? Colors.red[700] : Colors.green[700], fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'Los clientes verán tu pin en el mapa. Si prefieres no mostrar tu casa exacta, marca un punto cercano (por ejemplo, la esquina de tu colonia).',
+          style: TextStyle(fontSize: 11, color: kGray),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Mi Perfil Profesional'), backgroundColor: kPrimary, foregroundColor: Colors.white),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: _card(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Descripción de tus servicios', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _descripcionController,
-                maxLines: 4,
-                decoration: const InputDecoration(
-                  hintText: 'Explica tu experiencia, especialidades, garantías o lo que te destaca...',
+      body: _cargandoPerfil
+          ? const Center(child: CircularProgressIndicator(color: kAccent))
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: _card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('¿A qué te dedicas?', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      // ignore: deprecated_member_use
+                      value: _oficio,
+                      isExpanded: true,
+                      hint: const Text('Selecciona tu especialidad'),
+                      decoration: const InputDecoration(prefixIcon: Icon(Icons.handyman_outlined)),
+                      items: _oficios.map((o) => DropdownMenuItem(value: o, child: Text(o))).toList(),
+                      onChanged: (v) => setState(() => _oficio = v),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text('Tu ubicación', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    const Text('Sirve para que los clientes de tu zona te encuentren.', style: TextStyle(fontSize: 12, color: kGray)),
+                    const SizedBox(height: 10),
+                    _buildSelectorUbicacion(),
+                    const SizedBox(height: 20),
+                    const Text('Descripción de tus servicios', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _descripcionController,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        hintText: 'Explica tu experiencia, especialidades, garantías o lo que te destaca...',
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text('Fotos de tus trabajos', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    const Text('Selecciona fotos desde tu galería para mostrar tu trabajo.', style: TextStyle(fontSize: 12, color: kGray)),
+                    const SizedBox(height: 16),
+                    _buildSelectorImagen('Foto 1', _foto1, 1),
+                    const SizedBox(height: 12),
+                    _buildSelectorImagen('Foto 2', _foto2, 2),
+                    const SizedBox(height: 12),
+                    _buildSelectorImagen('Foto 3', _foto3, 3),
+                    const SizedBox(height: 24),
+                    _button('Guardar Perfil', _isLoading, _isLoading ? null : _guardarPerfil),
+                  ],
                 ),
               ),
-              const SizedBox(height: 20),
-              const Text('Fotos de tus trabajos', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              const Text('Selecciona fotos desde tu galería para mostrar tu trabajo.', style: TextStyle(fontSize: 12, color: kGray)),
-              const SizedBox(height: 16),
-              _buildSelectorImagen('Foto 1', _foto1, 1),
-              const SizedBox(height: 12),
-              _buildSelectorImagen('Foto 2', _foto2, 2),
-              const SizedBox(height: 12),
-              _buildSelectorImagen('Foto 3', _foto3, 3),
-              const SizedBox(height: 24),
-              _button('Guardar Perfil', _isLoading, _isLoading ? null : _guardarPerfil),
-            ],
-          ),
-        ),
-      ),
+            ),
     );
   }
 }

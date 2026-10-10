@@ -58,6 +58,17 @@ class CrearSolicitud(BaseModel):
     latitud: float
     longitud: float
 
+# Oficios permitidos. Deben contener las palabras que usa el buscador de clientes
+# (clima, carpintero, cerrajero, plomero, electricista, pintor).
+OFICIOS_VALIDOS = [
+    "Plomero",
+    "Electricista",
+    "Carpintero",
+    "Cerrajero",
+    "Pintor",
+    "Técnico de clima",
+]
+
 class CambiarEstadoSolicitud(BaseModel):
     estado: str  # "aceptado" o "rechazado"
 
@@ -300,9 +311,27 @@ def obtener_profesionales_cercanos(lat: float, lng: float, radio: float = 15.0, 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al buscar profesionales: {str(e)}")
 
+@app.get("/profesionales/oficios")
+def listar_oficios():
+    return {"oficios": OFICIOS_VALIDOS}
+
+@app.get("/profesionales/perfil")
+def obtener_mi_perfil_profesional(usuario_actual: dict = Depends(obtener_usuario_actual)):
+    if usuario_actual["rol"] != "Profesional":
+        raise HTTPException(status_code=403, detail="Acceso denegado. Solo profesionales.")
+    res = supabase.table("profesionales").select(
+        "id_profesional, oficio, descripcion, latitud, longitud, foto_1, foto_2, foto_3"
+    ).eq("id_usuario", usuario_actual["id_usuario"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="No se encontró el perfil del profesional.")
+    return {"profesional": res.data[0]}
+
 @app.put("/profesionales/perfil")
 async def actualizar_perfil_profesional(
     descripcion: str = Form(""),
+    oficio: Optional[str] = Form(None),
+    latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None),
     foto_1: Optional[UploadFile] = File(None),
     foto_2: Optional[UploadFile] = File(None),
     foto_3: Optional[UploadFile] = File(None),
@@ -314,6 +343,19 @@ async def actualizar_perfil_profesional(
 
         id_usuario = usuario_actual["id_usuario"]
         datos_actualizar = {"descripcion": descripcion}
+
+        if oficio:
+            if oficio not in OFICIOS_VALIDOS:
+                raise HTTPException(status_code=400, detail="Oficio no válido.")
+            datos_actualizar["oficio"] = oficio
+
+        if latitud is not None or longitud is not None:
+            if latitud is None or longitud is None:
+                raise HTTPException(status_code=400, detail="Debes enviar latitud y longitud juntas.")
+            if not (-90 <= latitud <= 90 and -180 <= longitud <= 180):
+                raise HTTPException(status_code=400, detail="Ubicación fuera de rango.")
+            datos_actualizar["latitud"] = latitud
+            datos_actualizar["longitud"] = longitud
 
         fotos_recibidas = {"foto_1": foto_1, "foto_2": foto_2, "foto_3": foto_3}
 
