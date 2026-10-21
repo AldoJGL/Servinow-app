@@ -58,11 +58,34 @@ class CrearSolicitud(BaseModel):
     latitud: float
     longitud: float
 
+# Oficios permitidos. Deben contener las palabras que usa el buscador de clientes
+# (clima, carpintero, cerrajero, plomero, electricista, pintor).
+OFICIOS_VALIDOS = [
+    "Plomero",
+    "Electricista",
+    "Carpintero",
+    "Cerrajero",
+    "Pintor",
+    "Técnico de clima",
+]
+
 class CambiarEstadoSolicitud(BaseModel):
     estado: str  # "aceptado" o "rechazado"
 
 class CrearMensaje(BaseModel):
     contenido: str
+
+class CrearCotizacion(BaseModel):
+    precio: float
+    detalle: Optional[str] = ""
+
+class ResponderCotizacion(BaseModel):
+    aceptar: bool
+
+# Flujo de una solicitud:
+#   pendiente -> aceptado -> cotizado -> confirmado   (el chat se habilita en "confirmado")
+#                              |-> cotizacion_rechazada -> (el profesional envía otra) -> cotizado
+#   pendiente -> rechazado
 
 # --- FUNCIONES AUXILIARES ---
 def verificar_contrasena(plain_password, hashed_password):
@@ -152,7 +175,7 @@ def conteo_no_leidos(ids_solicitudes: list, id_usuario) -> dict:
     return conteo
 
 def solicitudes_aceptadas_de(usuario: dict) -> list:
-    """Solicitudes aceptadas (= chats activos) del usuario, con el nombre de la contraparte."""
+    """Solicitudes confirmadas (= chats activos) del usuario, con el nombre de la contraparte."""
     columnas = "id_solicitud, descripcion_problema, id_cliente, id_profesional"
 
     if usuario["rol"] == "Profesional":
@@ -161,7 +184,7 @@ def solicitudes_aceptadas_de(usuario: dict) -> list:
             return []
         sols = (
             supabase.table("solicitudes").select(columnas)
-            .eq("id_profesional", id_prof).eq("estado", "aceptado")
+            .eq("id_profesional", id_prof).eq("estado", "confirmado")
             .order("id_solicitud", desc=True).execute().data
         )
         # La contraparte es el cliente
@@ -170,7 +193,7 @@ def solicitudes_aceptadas_de(usuario: dict) -> list:
     else:
         sols = (
             supabase.table("solicitudes").select(columnas)
-            .eq("id_cliente", usuario["id_usuario"]).eq("estado", "aceptado")
+            .eq("id_cliente", usuario["id_usuario"]).eq("estado", "confirmado")
             .order("id_solicitud", desc=True).execute().data
         )
         # La contraparte es el usuario dueño del perfil profesional
@@ -300,9 +323,27 @@ def obtener_profesionales_cercanos(lat: float, lng: float, radio: float = 15.0, 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al buscar profesionales: {str(e)}")
 
+@app.get("/profesionales/oficios")
+def listar_oficios():
+    return {"oficios": OFICIOS_VALIDOS}
+
+@app.get("/profesionales/perfil")
+def obtener_mi_perfil_profesional(usuario_actual: dict = Depends(obtener_usuario_actual)):
+    if usuario_actual["rol"] != "Profesional":
+        raise HTTPException(status_code=403, detail="Acceso denegado. Solo profesionales.")
+    res = supabase.table("profesionales").select(
+        "id_profesional, oficio, descripcion, latitud, longitud, foto_1, foto_2, foto_3"
+    ).eq("id_usuario", usuario_actual["id_usuario"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="No se encontró el perfil del profesional.")
+    return {"profesional": res.data[0]}
+
 @app.put("/profesionales/perfil")
 async def actualizar_perfil_profesional(
     descripcion: str = Form(""),
+    oficio: Optional[str] = Form(None),
+    latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None),
     foto_1: Optional[UploadFile] = File(None),
     foto_2: Optional[UploadFile] = File(None),
     foto_3: Optional[UploadFile] = File(None),
@@ -314,6 +355,19 @@ async def actualizar_perfil_profesional(
 
         id_usuario = usuario_actual["id_usuario"]
         datos_actualizar = {"descripcion": descripcion}
+
+        if oficio:
+            if oficio not in OFICIOS_VALIDOS:
+                raise HTTPException(status_code=400, detail="Oficio no válido.")
+            datos_actualizar["oficio"] = oficio
+
+        if latitud is not None or longitud is not None:
+            if latitud is None or longitud is None:
+                raise HTTPException(status_code=400, detail="Debes enviar latitud y longitud juntas.")
+            if not (-90 <= latitud <= 90 and -180 <= longitud <= 180):
+                raise HTTPException(status_code=400, detail="Ubicación fuera de rango.")
+            datos_actualizar["latitud"] = latitud
+            datos_actualizar["longitud"] = longitud
 
         fotos_recibidas = {"foto_1": foto_1, "foto_2": foto_2, "foto_3": foto_3}
 
@@ -386,8 +440,11 @@ def obtener_solicitudes_pendientes(usuario_actual: dict = Depends(obtener_usuari
             raise HTTPException(status_code=404, detail="Perfil profesional no encontrado")
 
         response = supabase.table("solicitudes").select(
-            "id_solicitud, descripcion_problema, direccion_texto, latitud, longitud, estado, fecha_creacion, usuarios!id_cliente(nombre, telefono)"
-        ).eq("id_profesional", id_profesional).eq("estado", "pendiente").execute()
+            "id_solicitud, descripcion_problema, direccion_texto, latitud, longitud, estado, fecha_creacion, "
+            "precio_cotizacion, detalle_cotizacion, usuarios!id_cliente(nombre, telefono)"
+        ).eq("id_profesional", id_profesional).in_(
+            "estado", ["pendiente", "aceptado", "cotizacion_rechazada", "cotizado"]
+        ).order("fecha_creacion", desc=True).execute()
 
         return {"solicitudes": response.data}
     except HTTPException:
@@ -426,6 +483,90 @@ def cambiar_estado_solicitud(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al actualizar estado: {str(e)}")
 
+@app.post("/solicitudes/{id_solicitud}/cotizacion")
+def enviar_cotizacion(
+    id_solicitud: int,
+    datos: CrearCotizacion,
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    """El profesional envía (o reenvía) su cotización de una solicitud que ya aceptó."""
+    try:
+        if usuario_actual["rol"] != "Profesional":
+            raise HTTPException(status_code=403, detail="Solo el profesional puede enviar cotizaciones")
+
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if sol["estado"] not in ("aceptado", "cotizacion_rechazada"):
+            raise HTTPException(status_code=400, detail="Solo puedes cotizar solicitudes que ya aceptaste y que no tengan una cotización pendiente")
+
+        if not math.isfinite(datos.precio) or datos.precio <= 0 or datos.precio > 1_000_000:
+            raise HTTPException(status_code=400, detail="El precio debe ser mayor a 0 y menor o igual a 1,000,000")
+
+        response = supabase.table("solicitudes").update({
+            "precio_cotizacion": round(datos.precio, 2),
+            "detalle_cotizacion": (datos.detalle or "").strip(),
+            "estado": "cotizado",
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "Cotización enviada", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al enviar la cotización: {str(e)}")
+
+@app.put("/solicitudes/{id_solicitud}/cotizacion")
+def responder_cotizacion(
+    id_solicitud: int,
+    datos: ResponderCotizacion,
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    """El cliente acepta o rechaza la cotización. Al aceptar se habilita el chat."""
+    try:
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if str(sol["id_cliente"]) != str(usuario_actual["id_usuario"]):
+            raise HTTPException(status_code=403, detail="Solo el cliente puede responder la cotización")
+        if sol["estado"] != "cotizado":
+            raise HTTPException(status_code=400, detail="No hay una cotización pendiente de respuesta")
+
+        nuevo_estado = "confirmado" if datos.aceptar else "cotizacion_rechazada"
+        response = supabase.table("solicitudes").update({"estado": nuevo_estado}).eq("id_solicitud", id_solicitud).execute()
+        return {
+            "mensaje": "Cotización aceptada. Ya pueden chatear" if datos.aceptar else "Cotización rechazada",
+            "solicitud": response.data[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al responder la cotización: {str(e)}")
+
+@app.get("/solicitudes/mias")
+def obtener_mis_solicitudes(usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """Solicitudes que envió el cliente, con el estado, la cotización y los datos del profesional."""
+    try:
+        sols = (
+            supabase.table("solicitudes")
+            .select("id_solicitud, descripcion_problema, direccion_texto, estado, precio_cotizacion, detalle_cotizacion, id_profesional")
+            .eq("id_cliente", usuario_actual["id_usuario"])
+            .order("id_solicitud", desc=True)
+            .limit(50)
+            .execute().data
+        )
+
+        info = {}
+        ids_prof = list({s["id_profesional"] for s in sols})
+        if ids_prof:
+            profs = supabase.table("profesionales").select("id_profesional, oficio, id_usuario").in_("id_profesional", ids_prof).execute().data
+            ids_users = list({p["id_usuario"] for p in profs})
+            users = supabase.table("usuarios").select("id_usuario, nombre").in_("id_usuario", ids_users).execute().data if ids_users else []
+            nombres = {u["id_usuario"]: u["nombre"] for u in users}
+            info = {p["id_profesional"]: {"oficio": p.get("oficio", ""), "nombre": nombres.get(p["id_usuario"], "Profesional")} for p in profs}
+
+        for s in sols:
+            datos = info.get(s["id_profesional"], {})
+            s["nombre_profesional"] = datos.get("nombre", "Profesional")
+            s["oficio"] = datos.get("oficio", "")
+        return {"solicitudes": sols}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al consultar tus solicitudes: {str(e)}")
+
 # --- NOTIFICACIONES (círculos rojos) ---
 @app.get("/notificaciones/resumen")
 def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual)):
@@ -437,15 +578,27 @@ def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual
         if usuario_actual["rol"] == "Profesional":
             id_prof = obtener_id_profesional(usuario_actual["id_usuario"])
             if id_prof is not None:
+                # Lo que necesita acción del profesional: solicitudes nuevas y cotizaciones por enviar
                 pend = (
                     supabase.table("solicitudes").select("id_solicitud")
-                    .eq("id_profesional", id_prof).eq("estado", "pendiente").execute()
+                    .eq("id_profesional", id_prof)
+                    .in_("estado", ["pendiente", "aceptado", "cotizacion_rechazada"]).execute()
                 )
                 solicitudes_pendientes = len(pend.data)
+
+        # Cotizaciones que el cliente todavía no responde
+        cotizaciones_pendientes = 0
+        if usuario_actual["rol"] != "Profesional":
+            cot = (
+                supabase.table("solicitudes").select("id_solicitud")
+                .eq("id_cliente", usuario_actual["id_usuario"]).eq("estado", "cotizado").execute()
+            )
+            cotizaciones_pendientes = len(cot.data)
 
         return {
             "mensajes_sin_leer": mensajes_sin_leer,
             "solicitudes_pendientes": solicitudes_pendientes,
+            "cotizaciones_pendientes": cotizaciones_pendientes,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al consultar notificaciones: {str(e)}")
@@ -455,8 +608,8 @@ def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual
 def enviar_mensaje(id_solicitud: int, mensaje: CrearMensaje, usuario_actual: dict = Depends(obtener_usuario_actual)):
     try:
         sol = verificar_participante(id_solicitud, usuario_actual)
-        if sol["estado"] != "aceptado":
-            raise HTTPException(status_code=403, detail="El chat se habilita cuando el profesional acepta la solicitud")
+        if sol["estado"] != "confirmado":
+            raise HTTPException(status_code=403, detail="El chat se habilita cuando el cliente acepta la cotización")
 
         contenido = mensaje.contenido.strip()
         if not contenido:

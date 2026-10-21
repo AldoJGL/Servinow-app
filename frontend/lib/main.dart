@@ -19,8 +19,7 @@ const kAccent = Color(0xFFFF7A1A);  // Naranja CTA
 const kBg = Color(0xFFF6F7FB);
 const kGray = Color(0xFF8A8A9E);
 
-// Cambia aquí la URL del backend (Android emulador: http://10.0.2.2:8000, celular real: IP de tu PC)
-const kBaseUrl = 'http://127.0.0.1:8000';
+const kBaseUrl = 'http://192.168.1.111:8000';
 
 String _detalleError(String body) {
   try {
@@ -71,6 +70,167 @@ Widget _button(String text, bool loading, VoidCallback? onPressed) {
           ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5))
           : Text(text, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
     ),
+  );
+}
+
+// ---------- Dirección legible y mapa pequeño (solicitudes de servicio) ----------
+// Devuelve algo como "Av. Juárez 123, Col. Centro, Guadalupe". Si no se puede obtener, devuelve null.
+Future<String?> obtenerDireccionLegible(double lat, double lng) async {
+  try {
+    final url = Uri.parse(
+        'https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&zoom=18&accept-language=es&lat=$lat&lon=$lng');
+    final res = await http
+        .get(url, headers: {'User-Agent': 'ServinowApp/1.0 (contacto@servinow.com)'})
+        .timeout(const Duration(seconds: 10));
+    if (res.statusCode != 200) return null;
+
+    final data = jsonDecode(res.body);
+    final address = (data['address'] as Map?) ?? {};
+
+    String elegir(List<String> claves) {
+      for (final c in claves) {
+        final v = address[c]?.toString().trim() ?? '';
+        if (v.isNotEmpty) return v;
+      }
+      return '';
+    }
+
+    final calle = elegir(['road', 'pedestrian', 'footway', 'path', 'street']);
+    final numero = elegir(['house_number']);
+    final colonia = elegir(['suburb', 'neighbourhood', 'quarter', 'residential', 'city_district', 'hamlet']);
+    final ciudad = elegir(['city', 'town', 'village', 'municipality', 'county']);
+
+    final linea = [calle, numero].where((e) => e.isNotEmpty).join(' ');
+    final partes = [linea, colonia, ciudad].where((e) => e.isNotEmpty).toList();
+    if (partes.length >= 2) return partes.join(', ');
+
+    // Si Nominatim devolvió pocos datos, usamos su nombre completo (recortado)
+    final nombreCompleto = (data['display_name'] ?? '').toString();
+    final trozos = nombreCompleto.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    if (trozos.length >= 2) return trozos.take(4).join(', ');
+
+    return partes.isNotEmpty ? partes.join(', ') : null;
+  } catch (e) {
+    debugPrint('Error al obtener dirección: $e');
+    return null;
+  }
+}
+
+// Rectángulo con el mapa y el pin de una ubicación (no se puede mover, es solo para ver)
+class MapaUbicacionMini extends StatelessWidget {
+  final LatLng punto;
+  final double alto;
+  const MapaUbicacionMini({super.key, required this.punto, this.alto = 170});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: alto,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: IgnorePointer(
+          child: FlutterMap(
+            options: MapOptions(initialCenter: punto, initialZoom: 16.0),
+            children: [
+              TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'com.example.servinow'),
+              MarkerLayer(markers: [
+                Marker(
+                  point: punto,
+                  width: 50,
+                  height: 50,
+                  alignment: Alignment.topCenter,
+                  child: const Icon(Icons.location_on, color: kAccent, size: 44),
+                ),
+              ]),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Muestra la dirección de una solicitud. Si la que se guardó está incompleta (por ejemplo solo "Guadalupe"),
+// la vuelve a calcular con las coordenadas.
+class DireccionSolicitud extends StatefulWidget {
+  final String textoGuardado;
+  final double? lat;
+  final double? lng;
+  final TextStyle? style;
+  const DireccionSolicitud({super.key, required this.textoGuardado, this.lat, this.lng, this.style});
+
+  @override
+  State<DireccionSolicitud> createState() => _DireccionSolicitudState();
+}
+
+class _DireccionSolicitudState extends State<DireccionSolicitud> {
+  static final Map<String, String> _cache = {};
+  String _texto = '';
+
+  @override
+  void initState() {
+    super.initState();
+    final segmentos = widget.textoGuardado.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    final bool esPobre = segmentos.length < 2 ||
+        widget.textoGuardado.startsWith('Ubicación GPS') ||
+        widget.textoGuardado.startsWith('Coordenadas');
+    _texto = segmentos.isEmpty ? 'Dirección sin especificar' : segmentos.join(', ');
+
+    if (esPobre && widget.lat != null && widget.lng != null) {
+      final clave = '${widget.lat!.toStringAsFixed(5)},${widget.lng!.toStringAsFixed(5)}';
+      final enCache = _cache[clave];
+      if (enCache != null) {
+        _texto = enCache;
+      } else {
+        obtenerDireccionLegible(widget.lat!, widget.lng!).then((d) {
+          if (d != null) {
+            _cache[clave] = d;
+            if (mounted) setState(() => _texto = d);
+          }
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(_texto, style: widget.style);
+  }
+}
+
+// ---------- Cotizaciones: utilidades compartidas ----------
+String _dinero(dynamic valor) {
+  final n = double.tryParse(valor?.toString() ?? '') ?? 0;
+  return '\$${n.toStringAsFixed(2)} MXN';
+}
+
+// Caja de aviso con ícono y color (estado de una solicitud, mensajes informativos)
+Widget _cajaInfo(IconData icono, Color color, String texto) {
+  return Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.10),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: color.withOpacity(0.35)),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icono, size: 20, color: color),
+        const SizedBox(width: 10),
+        Expanded(child: Text(texto, style: const TextStyle(fontSize: 13, height: 1.35))),
+      ],
+    ),
+  );
+}
+
+// Etiqueta pequeña con el estado de una solicitud
+Widget _chipEstado(String texto, Color color) {
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+    decoration: BoxDecoration(color: color.withOpacity(0.14), borderRadius: BorderRadius.circular(20)),
+    child: Text(texto, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: color)),
   );
 }
 
@@ -300,6 +460,7 @@ class MenuCliente extends StatefulWidget {
 class _MenuClienteState extends State<MenuCliente> {
   final TextEditingController _buscadorController = TextEditingController();
   int _mensajesSinLeer = 0;
+  int _cotizacionesPendientes = 0;
   Timer? _notifTimer;
 
   final List<Map<String, dynamic>> _categoriasPopulares = [
@@ -335,10 +496,146 @@ class _MenuClienteState extends State<MenuCliente> {
         if (mounted) {
           setState(() {
             _mensajesSinLeer = data['mensajes_sin_leer'] ?? 0;
+            _cotizacionesPendientes = data['cotizaciones_pendientes'] ?? 0;
           });
         }
       }
     } catch (_) {}
+  }
+
+  // Tarjeta horizontal a todo el ancho, con la misma altura que los cuadros de categorías
+  Widget _tarjetaHorizontal({
+    required String titulo,
+    required String subtitulo,
+    required IconData icono,
+    required Color color,
+    required int badge,
+    required VoidCallback onTap,
+  }) {
+    return LayoutBuilder(builder: (context, constraints) {
+      // Los cuadros de abajo son 3 columnas, separación de 10 y relación de aspecto 0.95
+      final double anchoCuadro = (constraints.maxWidth - 20) / 3;
+      final double alto = anchoCuadro / 0.95;
+
+      return SizedBox(
+        width: double.infinity,
+        height: alto,
+        child: Material(
+          color: color,
+          borderRadius: BorderRadius.circular(14),
+          elevation: 2,
+          shadowColor: color.withOpacity(0.3),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: onTap,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.18),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(icono, color: Colors.white, size: 28),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                titulo,
+                                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                subtitulo,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(color: Colors.white.withOpacity(0.9), fontSize: 13),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const Icon(Icons.chevron_right, color: Colors.white, size: 28),
+                      ],
+                    ),
+                  ),
+                ),
+                if (badge > 0)
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: Container(
+                      padding: const EdgeInsets.all(5),
+                      constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                      decoration: BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white, width: 2),
+                      ),
+                      child: Text(
+                        '$badge',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _tarjetaMensajes() {
+    return _tarjetaHorizontal(
+      titulo: 'Mis Mensajes',
+      subtitulo: _mensajesSinLeer == 0
+          ? 'Chatea con tus profesionales'
+          : (_mensajesSinLeer == 1 ? 'Tienes 1 mensaje nuevo' : 'Tienes $_mensajesSinLeer mensajes nuevos'),
+      icono: Icons.chat_bubble_outline,
+      color: kAccent,
+      badge: _mensajesSinLeer,
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => ListaChatsScreen(token: widget.token, idUsuario: widget.idUsuario),
+          ),
+        ).then((_) => _consultarNotificaciones());
+      },
+    );
+  }
+
+  Widget _tarjetaSolicitudes() {
+    return _tarjetaHorizontal(
+      titulo: 'Mis Solicitudes',
+      subtitulo: _cotizacionesPendientes == 0
+          ? 'Sigue el estado y las cotizaciones'
+          : (_cotizacionesPendientes == 1
+              ? 'Tienes 1 cotización por responder'
+              : 'Tienes $_cotizacionesPendientes cotizaciones por responder'),
+      icono: Icons.receipt_long_outlined,
+      color: kPrimary,
+      badge: _cotizacionesPendientes,
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => MisSolicitudesScreen(token: widget.token, idUsuario: widget.idUsuario),
+          ),
+        ).then((_) => _consultarNotificaciones());
+      },
+    );
   }
 
   void _irAlMapaConBusqueda(String query) {
@@ -379,39 +676,10 @@ class _MenuClienteState extends State<MenuCliente> {
                   ),
                   Row(
                     children: [
-                      Stack(
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.chat_bubble_outline, color: kAccent, size: 28),
-                            tooltip: 'Mis Mensajes',
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (context) => ListaChatsScreen(token: widget.token, idUsuario: widget.idUsuario),
-                                ),
-                              ).then((_) => _consultarNotificaciones());
-                            },
-                          ),
-                          if (_mensajesSinLeer > 0)
-                            Positioned(
-                              right: 6,
-                              top: 6,
-                              child: Container(
-                                padding: const EdgeInsets.all(4),
-                                decoration: const BoxDecoration(
-                                  color: Colors.red,
-                                  shape: BoxShape.circle,
-                                ),
-                                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
-                                child: Text(
-                                  '$_mensajesSinLeer',
-                                  style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
-                                  textAlign: TextAlign.center,
-                                ),
-                              ),
-                            ),
-                        ],
+                      IconButton(
+                        icon: const Icon(Icons.help_outline, color: kAccent, size: 28),
+                        tooltip: 'Ayuda',
+                        onPressed: () {}, // Pendiente: aquí irá la explicación de cada sección
                       ),
                       IconButton(
                         icon: const Icon(Icons.logout, color: kPrimary),
@@ -520,6 +788,10 @@ class _MenuClienteState extends State<MenuCliente> {
                   );
                 },
               ),
+              const SizedBox(height: 10),
+              _tarjetaSolicitudes(),
+              const SizedBox(height: 10),
+              _tarjetaMensajes(),
             ],
           ),
         ),
@@ -582,7 +854,7 @@ class _MenuProfesionalState extends State<MenuProfesional> {
         widget.nombreUsuario,
         'Panel de Trabajo',
         [
-          _ItemMenu('Solicitudes Pendientes', Icons.build, Colors.teal, _solicitudesPendientesCount, () {
+          _ItemMenu('Solicitudes y Cotizaciones', Icons.build, Colors.teal, _solicitudesPendientesCount, () {
             Navigator.push(
               context,
               MaterialPageRoute(builder: (context) => SolicitudesPendientesScreen(token: widget.token, idUsuario: widget.idUsuario)),
@@ -734,7 +1006,7 @@ class _ListaChatsScreenState extends State<ListaChatsScreen> {
   }
 }
 
-// --- PANTALLA PARA VER Y ACEPTAR/RECHAZAR SOLICITUDES (PROFESIONAL) ---
+// --- PANTALLA PARA ATENDER SOLICITUDES Y ENVIAR COTIZACIONES (PROFESIONAL) ---
 class SolicitudesPendientesScreen extends StatefulWidget {
   final String token;
   final String idUsuario;
@@ -747,32 +1019,43 @@ class SolicitudesPendientesScreen extends StatefulWidget {
 class _SolicitudesPendientesScreenState extends State<SolicitudesPendientesScreen> {
   bool _cargando = true;
   List<dynamic> _solicitudes = [];
+  Timer? _timer;
 
   @override
   void initState() {
     super.initState();
     _cargarSolicitudes();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _cargarSolicitudes(silencioso: true));
   }
 
-  Future<void> _cargarSolicitudes() async {
-    setState(() => _cargando = true);
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _cargarSolicitudes({bool silencioso = false}) async {
+    if (!silencioso) setState(() => _cargando = true);
     try {
       final response = await http.get(
         Uri.parse('$kBaseUrl/solicitudes/pendientes'),
         headers: {'Authorization': 'Bearer ${widget.token}'},
       );
 
+      if (!mounted) return;
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         setState(() => _solicitudes = data['solicitudes'] ?? []);
       }
     } catch (e) {
-      if (mounted) _snack(context, 'Error al cargar solicitudes', color: Colors.red);
+      if (mounted && !silencioso) _snack(context, 'Error al cargar solicitudes', color: Colors.red);
     }
-    setState(() => _cargando = false);
+    if (mounted) setState(() => _cargando = false);
   }
 
-  Future<void> _responderSolicitud(int idSolicitud, String estado) async {
+  // Aceptar o rechazar la solicitud del cliente. Al aceptar, se pide la cotización de inmediato.
+  Future<void> _responderSolicitud(dynamic item, String estado) async {
+    final int idSolicitud = (item['id_solicitud'] as num).toInt();
     try {
       final response = await http.put(
         Uri.parse('$kBaseUrl/solicitudes/$idSolicitud/estado'),
@@ -783,28 +1066,18 @@ class _SolicitudesPendientesScreenState extends State<SolicitudesPendientesScree
         body: jsonEncode({'estado': estado}),
       );
 
+      if (!mounted) return;
       if (response.statusCode == 200) {
         _snack(
-          context, 
-          estado == 'aceptado' ? '¡Solicitud aceptada! Abriendo chat...' : 'Solicitud rechazada', 
-          color: estado == 'aceptado' ? Colors.green : Colors.red
+          context,
+          estado == 'aceptado' ? '¡Solicitud aceptada! Ahora envía tu cotización al cliente.' : 'Solicitud rechazada',
+          color: estado == 'aceptado' ? Colors.green : Colors.red,
         );
-
+        await _cargarSolicitudes(silencioso: true);
         if (estado == 'aceptado' && mounted) {
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (context) => ChatScreen(
-                idSolicitud: idSolicitud,
-                token: widget.token,
-                idUsuarioActual: widget.idUsuario,
-              ),
-            ),
-          );
+          await _abrirCotizacion(item);
         }
-
-        _cargarSolicitudes();
-      } else if (mounted) {
+      } else {
         _snack(context, _detalleError(response.body), color: Colors.red);
       }
     } catch (e) {
@@ -812,98 +1085,557 @@ class _SolicitudesPendientesScreenState extends State<SolicitudesPendientesScree
     }
   }
 
+  // Ventana para escribir el precio y el detalle de la cotización
+  Future<void> _abrirCotizacion(dynamic item) async {
+    final int idSolicitud = (item['id_solicitud'] as num).toInt();
+    final String clienteNombre =
+        item['usuarios'] != null ? (item['usuarios']['nombre'] ?? 'el cliente').toString() : 'el cliente';
+
+    final resultado = await showDialog<Map<String, dynamic>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => DialogoCotizacion(clienteNombre: clienteNombre),
+    );
+
+    if (!mounted) return;
+    if (resultado == null) {
+      _snack(context, 'Puedes enviar la cotización cuando quieras desde esta pantalla.', color: kGray);
+      return;
+    }
+
+    try {
+      final response = await http.post(
+        Uri.parse('$kBaseUrl/solicitudes/$idSolicitud/cotizacion'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${widget.token}',
+        },
+        body: jsonEncode({'precio': resultado['precio'], 'detalle': resultado['detalle']}),
+      );
+
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        _snack(context, 'Cotización enviada. Espera la respuesta del cliente.', color: Colors.green);
+        _cargarSolicitudes(silencioso: true);
+      } else {
+        _snack(context, _detalleError(response.body), color: Colors.red);
+      }
+    } catch (e) {
+      if (mounted) _snack(context, 'Error de conexión al enviar la cotización', color: Colors.red);
+    }
+  }
+
+  Widget _etiquetaEstado(String estado) {
+    switch (estado) {
+      case 'pendiente':
+        return _chipEstado('Nueva', kAccent);
+      case 'aceptado':
+        return _chipEstado('Por cotizar', Colors.blue);
+      case 'cotizacion_rechazada':
+        return _chipEstado('Cotización rechazada', Colors.red);
+      case 'cotizado':
+        return _chipEstado('Esperando al cliente', kGray);
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Widget _bloqueAcciones(dynamic item, String estado) {
+    final String detalle = (item['detalle_cotizacion'] ?? '').toString().trim();
+
+    switch (estado) {
+      case 'pendiente':
+        return Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.red,
+                  side: const BorderSide(color: Colors.red),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () => _responderSolicitud(item, 'rechazado'),
+                child: const Text('Rechazar'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () => _responderSolicitud(item, 'aceptado'),
+                child: const Text('Aceptar'),
+              ),
+            ),
+          ],
+        );
+
+      case 'aceptado':
+        return Column(
+          children: [
+            _cajaInfo(Icons.info_outline, Colors.blue,
+                'Aceptaste esta solicitud. Envía tu cotización para que el cliente pueda confirmarla.'),
+            const SizedBox(height: 12),
+            _button('Enviar cotización', false, () => _abrirCotizacion(item)),
+          ],
+        );
+
+      case 'cotizacion_rechazada':
+        return Column(
+          children: [
+            _cajaInfo(Icons.cancel_outlined, Colors.red,
+                'El cliente rechazó tu cotización de ${_dinero(item['precio_cotizacion'])}. Puedes enviarle una nueva.'),
+            const SizedBox(height: 12),
+            _button('Enviar nueva cotización', false, () => _abrirCotizacion(item)),
+          ],
+        );
+
+      case 'cotizado':
+        return _cajaInfo(
+          Icons.hourglass_top,
+          kAccent,
+          'Cotización enviada: ${_dinero(item['precio_cotizacion'])}'
+          '${detalle.isEmpty ? '' : '\n$detalle'}'
+          '\nEsperando la respuesta del cliente. Cuando la acepte se habilitará el chat.',
+        );
+
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Widget _tarjetaSolicitud(dynamic item) {
+    final String estado = (item['estado'] ?? 'pendiente').toString();
+    final String clienteNombre = item['usuarios'] != null ? (item['usuarios']['nombre'] ?? 'Cliente').toString() : 'Cliente';
+    final String clienteTel = item['usuarios'] != null ? (item['usuarios']['telefono'] ?? 'N/A').toString() : 'N/A';
+    final direccion = item['direccion_texto'] ?? 'Dirección sin especificar';
+    final double? latSol = (item['latitud'] as num?)?.toDouble();
+    final double? lngSol = (item['longitud'] as num?)?.toDouble();
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: kAccent.withOpacity(0.12),
+                  child: const Icon(Icons.person, color: kAccent),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(clienteNombre, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      Text('Tel: $clienteTel', style: const TextStyle(color: kGray, fontSize: 12)),
+                    ],
+                  ),
+                ),
+                _etiquetaEstado(estado),
+              ],
+            ),
+            const Divider(height: 24),
+            const Text('Descripción del problema:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: kPrimary)),
+            const SizedBox(height: 4),
+            Text(item['descripcion_problema'] ?? '', style: const TextStyle(fontSize: 14)),
+            const SizedBox(height: 12),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.location_on, size: 18, color: kAccent),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: DireccionSolicitud(
+                    textoGuardado: direccion.toString(),
+                    lat: latSol,
+                    lng: lngSol,
+                    style: const TextStyle(fontSize: 13, color: Colors.black87, fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ],
+            ),
+            if (latSol != null && lngSol != null) ...[
+              const SizedBox(height: 10),
+              MapaUbicacionMini(punto: LatLng(latSol, lngSol), alto: 150),
+            ],
+            const SizedBox(height: 18),
+            _bloqueAcciones(item, estado),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Solicitudes Pendientes'), backgroundColor: kPrimary, foregroundColor: Colors.white),
+      appBar: AppBar(title: const Text('Solicitudes y Cotizaciones'), backgroundColor: kPrimary, foregroundColor: Colors.white),
       body: _cargando
           ? const Center(child: CircularProgressIndicator(color: kAccent))
           : _solicitudes.isEmpty
-              ? const Center(child: Text('No tienes solicitudes pendientes.', style: TextStyle(color: kGray)))
+              ? const Center(child: Text('No tienes solicitudes por atender.', style: TextStyle(color: kGray)))
               : ListView.builder(
                   padding: const EdgeInsets.all(16),
                   itemCount: _solicitudes.length,
-                  itemBuilder: (context, index) {
-                    final item = _solicitudes[index];
-                    final clienteNombre = item['usuarios'] != null ? item['usuarios']['nombre'] : 'Cliente';
-                    final clienteTel = item['usuarios'] != null ? item['usuarios']['telefono'] : 'N/A';
-                    final direccion = item['direccion_texto'] ?? 'Dirección sin especificar';
+                  itemBuilder: (context, index) => _tarjetaSolicitud(_solicitudes[index]),
+                ),
+    );
+  }
+}
 
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 16),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16.0),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                CircleAvatar(
-                                  backgroundColor: kAccent.withOpacity(0.12),
-                                  child: const Icon(Icons.person, color: kAccent),
-                                ),
-                                const SizedBox(width: 12),
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(clienteNombre, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                                    Text('Tel: $clienteTel', style: const TextStyle(color: kGray, fontSize: 12)),
-                                  ],
-                                ),
-                              ],
-                            ),
-                            const Divider(height: 24),
-                            const Text('Descripción del problema:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: kPrimary)),
-                            const SizedBox(height: 4),
-                            Text(item['descripcion_problema'] ?? '', style: const TextStyle(fontSize: 14)),
-                            const SizedBox(height: 12),
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Icon(Icons.location_on, size: 18, color: kAccent),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    direccion, 
-                                    style: const TextStyle(fontSize: 13, color: Colors.black87, fontWeight: FontWeight.w500)
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 18),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: OutlinedButton(
-                                    style: OutlinedButton.styleFrom(
-                                      foregroundColor: Colors.red,
-                                      side: const BorderSide(color: Colors.red),
-                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                    ),
-                                    onPressed: () => _responderSolicitud(item['id_solicitud'], 'rechazado'),
-                                    child: const Text('Rechazar'),
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.green,
-                                      foregroundColor: Colors.white,
-                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                    ),
-                                    onPressed: () => _responderSolicitud(item['id_solicitud'], 'aceptado'),
-                                    child: const Text('Aceptar'),
-                                  ),
-                                ),
-                              ],
-                            )
-                          ],
-                        ),
+// Ventana donde el profesional escribe el precio y el detalle de su cotización
+class DialogoCotizacion extends StatefulWidget {
+  final String clienteNombre;
+  const DialogoCotizacion({super.key, required this.clienteNombre});
+
+  @override
+  State<DialogoCotizacion> createState() => _DialogoCotizacionState();
+}
+
+class _DialogoCotizacionState extends State<DialogoCotizacion> {
+  final TextEditingController _precioController = TextEditingController();
+  final TextEditingController _detalleController = TextEditingController();
+  String? _error;
+
+  @override
+  void dispose() {
+    _precioController.dispose();
+    _detalleController.dispose();
+    super.dispose();
+  }
+
+  void _enviar() {
+    final precio = double.tryParse(_precioController.text.trim().replaceAll(',', '.'));
+    if (precio == null || precio <= 0) {
+      setState(() => _error = 'Escribe un precio válido, mayor a 0.');
+      return;
+    }
+    if (precio > 1000000) {
+      setState(() => _error = 'El precio no puede ser mayor a 1,000,000.');
+      return;
+    }
+    Navigator.pop(context, {'precio': precio, 'detalle': _detalleController.text.trim()});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Enviar cotización'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Para ${widget.clienteNombre}', style: const TextStyle(color: kGray, fontSize: 13)),
+            const SizedBox(height: 14),
+            TextField(
+              controller: _precioController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: InputDecoration(
+                labelText: 'Precio total (MXN)',
+                prefixIcon: const Icon(Icons.attach_money),
+                errorText: _error,
+              ),
+              onChanged: (_) {
+                if (_error != null) setState(() => _error = null);
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _detalleController,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Qué incluye / tiempo estimado',
+                hintText: 'Ej. Mano de obra y materiales. Tiempo: 2 horas.',
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
+        ElevatedButton(onPressed: _enviar, child: const Text('Enviar')),
+      ],
+    );
+  }
+}
+
+// --- PANTALLA DE SOLICITUDES DEL CLIENTE (estado y cotizaciones) ---
+class MisSolicitudesScreen extends StatefulWidget {
+  final String token;
+  final String idUsuario;
+  const MisSolicitudesScreen({super.key, required this.token, required this.idUsuario});
+
+  @override
+  State<MisSolicitudesScreen> createState() => _MisSolicitudesScreenState();
+}
+
+class _MisSolicitudesScreenState extends State<MisSolicitudesScreen> {
+  bool _cargando = true;
+  List<dynamic> _solicitudes = [];
+  Timer? _timer;
+  int? _respondiendoId;
+
+  @override
+  void initState() {
+    super.initState();
+    _cargarSolicitudes();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _cargarSolicitudes(silencioso: true));
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _cargarSolicitudes({bool silencioso = false}) async {
+    if (!silencioso) setState(() => _cargando = true);
+    try {
+      final response = await http.get(
+        Uri.parse('$kBaseUrl/solicitudes/mias'),
+        headers: {'Authorization': 'Bearer ${widget.token}'},
+      );
+
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() => _solicitudes = data['solicitudes'] ?? []);
+      } else if (!silencioso) {
+        _snack(context, _detalleError(response.body), color: Colors.red);
+      }
+    } catch (e) {
+      if (mounted && !silencioso) _snack(context, 'Error al cargar tus solicitudes', color: Colors.red);
+    }
+    if (mounted) setState(() => _cargando = false);
+  }
+
+  void _abrirChat(dynamic item) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => ChatScreen(
+          titulo: (item['nombre_profesional'] ?? 'Profesional').toString(),
+          idSolicitud: (item['id_solicitud'] as num).toInt(),
+          token: widget.token,
+          idUsuarioActual: widget.idUsuario,
+        ),
+      ),
+    ).then((_) => _cargarSolicitudes(silencioso: true));
+  }
+
+  // Aceptar o rechazar la cotización que mandó el profesional
+  Future<void> _responderCotizacion(dynamic item, bool aceptar) async {
+    if (_respondiendoId != null) return;
+    final int idSolicitud = (item['id_solicitud'] as num).toInt();
+    setState(() => _respondiendoId = idSolicitud);
+
+    try {
+      final response = await http.put(
+        Uri.parse('$kBaseUrl/solicitudes/$idSolicitud/cotizacion'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${widget.token}',
+        },
+        body: jsonEncode({'aceptar': aceptar}),
+      );
+
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        _snack(
+          context,
+          aceptar ? '¡Cotización aceptada! Ya puedes chatear con el profesional.' : 'Cotización rechazada.',
+          color: aceptar ? Colors.green : Colors.red,
+        );
+        await _cargarSolicitudes(silencioso: true);
+        if (aceptar && mounted) _abrirChat(item);
+      } else {
+        _snack(context, _detalleError(response.body), color: Colors.red);
+      }
+    } catch (e) {
+      if (mounted) _snack(context, 'Error de conexión al responder la cotización', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _respondiendoId = null);
+    }
+  }
+
+  Widget _etiquetaEstado(String estado) {
+    switch (estado) {
+      case 'pendiente':
+        return _chipEstado('Enviada', kGray);
+      case 'aceptado':
+        return _chipEstado('En preparación', Colors.blue);
+      case 'cotizado':
+        return _chipEstado('Cotización recibida', kAccent);
+      case 'cotizacion_rechazada':
+        return _chipEstado('Cotización rechazada', Colors.red);
+      case 'confirmado':
+        return _chipEstado('Confirmado', Colors.green);
+      case 'rechazado':
+        return _chipEstado('Rechazada', Colors.red);
+      default:
+        return _chipEstado(estado, kGray);
+    }
+  }
+
+  Widget _bloqueEstado(dynamic item, String estado) {
+    final int id = (item['id_solicitud'] as num).toInt();
+    final bool ocupado = _respondiendoId == id;
+    final String detalle = (item['detalle_cotizacion'] ?? '').toString().trim();
+
+    switch (estado) {
+      case 'pendiente':
+        return _cajaInfo(Icons.hourglass_top, kGray, 'Enviaste esta solicitud. Esperando que el profesional la acepte.');
+
+      case 'aceptado':
+        return _cajaInfo(Icons.edit_outlined, Colors.blue, 'El profesional aceptó tu solicitud y está preparando su cotización.');
+
+      case 'cotizado':
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: kAccent.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: kAccent.withOpacity(0.4)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Cotización recibida', style: TextStyle(fontSize: 12, color: kGray, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              Text(_dinero(item['precio_cotizacion']), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: kPrimary)),
+              if (detalle.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(detalle, style: const TextStyle(fontSize: 13, height: 1.35)),
+              ],
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.red,
+                        side: const BorderSide(color: Colors.red),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                       ),
-                    );
-                  },
+                      onPressed: ocupado ? null : () => _responderCotizacion(item, false),
+                      child: const Text('Rechazar'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      onPressed: ocupado ? null : () => _responderCotizacion(item, true),
+                      child: const Text('Aceptar'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+
+      case 'cotizacion_rechazada':
+        return _cajaInfo(Icons.cancel_outlined, Colors.red,
+            'Rechazaste la cotización de ${_dinero(item['precio_cotizacion'])}. El profesional puede enviarte una nueva.');
+
+      case 'confirmado':
+        return Column(
+          children: [
+            _cajaInfo(Icons.check_circle_outline, Colors.green,
+                'Cotización aceptada: ${_dinero(item['precio_cotizacion'])}. Ya pueden chatear para coordinar el servicio.'),
+            const SizedBox(height: 12),
+            _button('Abrir chat', false, () => _abrirChat(item)),
+          ],
+        );
+
+      case 'rechazado':
+        return _cajaInfo(Icons.block, Colors.red, 'El profesional no pudo atender esta solicitud.');
+
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Widget _tarjetaSolicitud(dynamic item) {
+    final String estado = (item['estado'] ?? 'pendiente').toString();
+    final String nombre = (item['nombre_profesional'] ?? 'Profesional').toString();
+    final String oficio = (item['oficio'] ?? '').toString();
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: kAccent.withOpacity(0.12),
+                  child: const Icon(Icons.person, color: kAccent),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(nombre, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      if (oficio.isNotEmpty) Text(oficio, style: const TextStyle(color: kAccent, fontSize: 12, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+                _etiquetaEstado(estado),
+              ],
+            ),
+            const Divider(height: 24),
+            const Text('Tu problema:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: kPrimary)),
+            const SizedBox(height: 4),
+            Text((item['descripcion_problema'] ?? '').toString(), style: const TextStyle(fontSize: 14)),
+            const SizedBox(height: 14),
+            _bloqueEstado(item, estado),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Mis Solicitudes'), backgroundColor: kPrimary, foregroundColor: Colors.white),
+      body: _cargando
+          ? const Center(child: CircularProgressIndicator(color: kAccent))
+          : _solicitudes.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(32),
+                    child: Text(
+                      'Aún no has enviado solicitudes.\nBusca un profesional en el mapa y solicita su servicio.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: kGray),
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: _solicitudes.length,
+                  itemBuilder: (context, index) => _tarjetaSolicitud(_solicitudes[index]),
                 ),
     );
   }
@@ -919,13 +1651,127 @@ class EditarPerfilProfesionalScreen extends StatefulWidget {
 }
 
 class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalScreen> {
+  // Debe coincidir con OFICIOS_VALIDOS del backend (y con las palabras del buscador de clientes)
+  static const List<String> _oficios = [
+    'Plomero',
+    'Electricista',
+    'Carpintero',
+    'Cerrajero',
+    'Pintor',
+    'Técnico de clima',
+  ];
+  static const LatLng _centroPorDefecto = LatLng(25.7969, -100.2958); // Gral. Escobedo, N.L.
+
   final TextEditingController _descripcionController = TextEditingController();
   final ImagePicker _picker = ImagePicker();
-  
+  final MapController _mapController = MapController();
+
   XFile? _foto1;
   XFile? _foto2;
   XFile? _foto3;
+  String? _oficio;
+  LatLng? _ubicacion;
+  String _direccionTexto = '';
   bool _isLoading = false;
+  bool _cargandoPerfil = true;
+  bool _obteniendoGps = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _cargarPerfil();
+  }
+
+  @override
+  void dispose() {
+    _descripcionController.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  // Carga lo que el profesional ya tenía guardado (oficio, ubicación, descripción)
+  Future<void> _cargarPerfil() async {
+    try {
+      final res = await http.get(
+        Uri.parse('$kBaseUrl/profesionales/perfil'),
+        headers: {'Authorization': 'Bearer ${widget.token}'},
+      );
+      if (res.statusCode == 200) {
+        final p = jsonDecode(res.body)['profesional'];
+        final oficioGuardado = p['oficio']?.toString();
+        final lat = p['latitud'];
+        final lng = p['longitud'];
+        if (!mounted) return;
+        setState(() {
+          _descripcionController.text = (p['descripcion'] ?? '').toString();
+          if (oficioGuardado != null && _oficios.contains(oficioGuardado)) {
+            _oficio = oficioGuardado;
+          }
+          if (lat != null && lng != null) {
+            _ubicacion = LatLng((lat as num).toDouble(), (lng as num).toDouble());
+          }
+        });
+        if (_ubicacion != null) _actualizarDireccion(_ubicacion!);
+      }
+    } catch (e) {
+      debugPrint('Error al cargar perfil: $e');
+    } finally {
+      if (mounted) setState(() => _cargandoPerfil = false);
+    }
+  }
+
+  // Convierte coordenadas en una dirección legible (solo informativa)
+  Future<void> _actualizarDireccion(LatLng punto) async {
+    try {
+      final url = Uri.parse(
+          'https://nominatim.openstreetmap.org/reverse?format=json&lat=${punto.latitude}&lon=${punto.longitude}');
+      final res = await http.get(url, headers: {'User-Agent': 'ServinowApp/1.0 (contacto@servinow.com)'});
+      if (res.statusCode == 200) {
+        final address = jsonDecode(res.body)['address'] ?? {};
+        final calle = address['road'] ?? address['pedestrian'] ?? '';
+        final colonia = address['suburb'] ?? address['neighbourhood'] ?? '';
+        final ciudad = address['city'] ?? address['town'] ?? address['village'] ?? '';
+        final partes = [calle, colonia, ciudad].where((e) => e.toString().isNotEmpty).join(', ');
+        // Si el usuario ya movió el pin a otro lado, ignoramos esta respuesta vieja
+        if (mounted && _ubicacion == punto) setState(() => _direccionTexto = partes);
+      }
+    } catch (_) {}
+  }
+
+  void _fijarUbicacion(LatLng punto, {bool moverMapa = false}) {
+    setState(() {
+      _ubicacion = punto;
+      _direccionTexto = '';
+    });
+    if (moverMapa) _mapController.move(punto, 16);
+    _actualizarDireccion(punto);
+  }
+
+  Future<void> _usarMiUbicacion() async {
+    setState(() => _obteniendoGps = true);
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        if (mounted) _snack(context, 'Activa el GPS de tu dispositivo.', color: Colors.orange[800]!);
+        return;
+      }
+      var permiso = await Geolocator.checkPermission();
+      if (permiso == LocationPermission.denied) {
+        permiso = await Geolocator.requestPermission();
+      }
+      if (permiso == LocationPermission.denied || permiso == LocationPermission.deniedForever) {
+        if (mounted) _snack(context, 'Permiso de ubicación denegado. También puedes tocar el mapa para marcar tu casa.', color: Colors.orange[800]!);
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      _fijarUbicacion(LatLng(pos.latitude, pos.longitude), moverMapa: true);
+    } catch (e) {
+      if (mounted) _snack(context, 'No se pudo obtener tu ubicación: $e', color: Colors.orange[800]!);
+    } finally {
+      if (mounted) setState(() => _obteniendoGps = false);
+    }
+  }
 
   Future<void> _seleccionarImagen(int numeroFoto) async {
     final XFile? imagen = await _picker.pickImage(source: ImageSource.gallery, imageQuality: 80);
@@ -940,7 +1786,7 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
   Future<void> _adjuntarArchivo(http.MultipartRequest request, String fieldName, XFile? archivo) async {
     if (archivo == null) return;
-    
+
     final bytes = await archivo.readAsBytes();
     final extension = archivo.name.split('.').last.toLowerCase();
     final mimeType = (extension == 'png') ? 'png' : 'jpeg';
@@ -956,6 +1802,15 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
   }
 
   Future<void> _guardarPerfil() async {
+    if (_oficio == null) {
+      _snack(context, 'Selecciona a qué te dedicas.', color: Colors.orange[800]!);
+      return;
+    }
+    if (_ubicacion == null) {
+      _snack(context, 'Marca tu ubicación para que los clientes cercanos puedan encontrarte.', color: Colors.orange[800]!);
+      return;
+    }
+
     setState(() => _isLoading = true);
     try {
       var request = http.MultipartRequest(
@@ -965,6 +1820,9 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
       request.headers['Authorization'] = 'Bearer ${widget.token}';
       request.fields['descripcion'] = _descripcionController.text.trim();
+      request.fields['oficio'] = _oficio!;
+      request.fields['latitud'] = _ubicacion!.latitude.toString();
+      request.fields['longitud'] = _ubicacion!.longitude.toString();
 
       await _adjuntarArchivo(request, 'foto_1', _foto1);
       await _adjuntarArchivo(request, 'foto_2', _foto2);
@@ -975,12 +1833,12 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
 
       if (response.statusCode == 200) {
         if (mounted) {
-          _snack(context, 'Perfil e imágenes guardados con éxito', color: Colors.green);
+          _snack(context, 'Perfil guardado con éxito', color: Colors.green);
           Navigator.pop(context);
         }
       } else {
         if (mounted) {
-          _snack(context, 'Error (${response.statusCode}): ${response.body}', color: Colors.red);
+          _snack(context, 'Error (${response.statusCode}): ${_detalleError(response.body)}', color: Colors.red);
         }
       }
     } catch (e) {
@@ -1030,41 +1888,119 @@ class _EditarPerfilProfesionalScreenState extends State<EditarPerfilProfesionalS
     );
   }
 
+  Widget _buildSelectorUbicacion() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 240,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: _ubicacion ?? _centroPorDefecto,
+                initialZoom: _ubicacion != null ? 16.0 : 12.0,
+                onTap: (tapPosition, punto) => _fijarUbicacion(punto),
+              ),
+              children: [
+                TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'com.example.servinow'),
+                if (_ubicacion != null)
+                  MarkerLayer(markers: [
+                    Marker(
+                      point: _ubicacion!,
+                      width: 50,
+                      height: 50,
+                      alignment: Alignment.topCenter,
+                      child: const Icon(Icons.location_on, color: kAccent, size: 44),
+                    ),
+                  ]),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _obteniendoGps ? null : _usarMiUbicacion,
+            icon: _obteniendoGps
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.my_location),
+            label: const Text('Usar mi ubicación actual'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          _ubicacion == null
+              ? 'Toca el mapa para marcar dónde vives.'
+              : (_direccionTexto.isEmpty ? 'Ubicación marcada.' : 'Ubicación marcada: $_direccionTexto'),
+          style: TextStyle(fontSize: 12, color: _ubicacion == null ? Colors.red[700] : Colors.green[700], fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'Los clientes verán tu pin en el mapa. Si prefieres no mostrar tu casa exacta, marca un punto cercano (por ejemplo, la esquina de tu colonia).',
+          style: TextStyle(fontSize: 11, color: kGray),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Mi Perfil Profesional'), backgroundColor: kPrimary, foregroundColor: Colors.white),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: _card(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Descripción de tus servicios', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _descripcionController,
-                maxLines: 4,
-                decoration: const InputDecoration(
-                  hintText: 'Explica tu experiencia, especialidades, garantías o lo que te destaca...',
+      body: _cargandoPerfil
+          ? const Center(child: CircularProgressIndicator(color: kAccent))
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: _card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('¿A qué te dedicas?', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      // ignore: deprecated_member_use
+                      value: _oficio,
+                      isExpanded: true,
+                      hint: const Text('Selecciona tu especialidad'),
+                      decoration: const InputDecoration(prefixIcon: Icon(Icons.handyman_outlined)),
+                      items: _oficios.map((o) => DropdownMenuItem(value: o, child: Text(o))).toList(),
+                      onChanged: (v) => setState(() => _oficio = v),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text('Tu ubicación', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    const Text('Sirve para que los clientes de tu zona te encuentren.', style: TextStyle(fontSize: 12, color: kGray)),
+                    const SizedBox(height: 10),
+                    _buildSelectorUbicacion(),
+                    const SizedBox(height: 20),
+                    const Text('Descripción de tus servicios', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _descripcionController,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        hintText: 'Explica tu experiencia, especialidades, garantías o lo que te destaca...',
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text('Fotos de tus trabajos', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    const Text('Selecciona fotos desde tu galería para mostrar tu trabajo.', style: TextStyle(fontSize: 12, color: kGray)),
+                    const SizedBox(height: 16),
+                    _buildSelectorImagen('Foto 1', _foto1, 1),
+                    const SizedBox(height: 12),
+                    _buildSelectorImagen('Foto 2', _foto2, 2),
+                    const SizedBox(height: 12),
+                    _buildSelectorImagen('Foto 3', _foto3, 3),
+                    const SizedBox(height: 24),
+                    _button('Guardar Perfil', _isLoading, _isLoading ? null : _guardarPerfil),
+                  ],
                 ),
               ),
-              const SizedBox(height: 20),
-              const Text('Fotos de tus trabajos', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              const Text('Selecciona fotos desde tu galería para mostrar tu trabajo.', style: TextStyle(fontSize: 12, color: kGray)),
-              const SizedBox(height: 16),
-              _buildSelectorImagen('Foto 1', _foto1, 1),
-              const SizedBox(height: 12),
-              _buildSelectorImagen('Foto 2', _foto2, 2),
-              const SizedBox(height: 12),
-              _buildSelectorImagen('Foto 3', _foto3, 3),
-              const SizedBox(height: 24),
-              _button('Guardar Perfil', _isLoading, _isLoading ? null : _guardarPerfil),
-            ],
-          ),
-        ),
-      ),
+            ),
     );
   }
 }
@@ -1331,29 +2267,8 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
   bool _enviandoSolicitud = false;
 
   Future<String> _obtenerDireccionTexto(double lat, double lng) async {
-    try {
-      final url = Uri.parse('https://nominatim.openstreetmap.org/reverse?format=json&lat=$lat&lon=$lng');
-      final res = await http.get(
-        url, 
-        headers: {'User-Agent': 'ServinowApp/1.0 (contacto@servinow.com)'}
-      );
-      
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        final address = data['address'] ?? {};
-        
-        String calle = address['road'] ?? address['pedestrian'] ?? '';
-        String numero = address['house_number'] ?? '';
-        String colonia = address['suburb'] ?? address['neighbourhood'] ?? '';
-        String ciudad = address['city'] ?? address['town'] ?? address['village'] ?? '';
-
-        String dir = '$calle $numero, $colonia, $ciudad'.replaceAll(RegExp(r'^\s*,\s*'), '').trim();
-        return dir.isNotEmpty ? dir : "Coordenadas: $lat, $lng";
-      }
-    } catch (e) {
-      debugPrint("Error al obtener dirección HTTP: $e");
-    }
-    return "Ubicación GPS ($lat, $lng)";
+    final direccion = await obtenerDireccionLegible(lat, lng);
+    return direccion ?? 'Coordenadas: ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}';
   }
 
   void _mostrarModalSolicitud(BuildContext context) async {
@@ -1374,14 +2289,15 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
       context: context,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      builder: (context) {
+      builder: (modalContext) {
         return Padding(
           padding: EdgeInsets.only(
-            bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+            bottom: MediaQuery.of(modalContext).viewInsets.bottom + 20,
             left: 20,
             right: 20,
             top: 24,
           ),
+          child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1404,6 +2320,8 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
                   ],
                 ),
               ),
+              const SizedBox(height: 12),
+              MapaUbicacionMini(punto: widget.posicionCliente!, alto: 170),
               const SizedBox(height: 16),
               const Text('Describe tu problema:', style: TextStyle(fontWeight: FontWeight.w600)),
               const SizedBox(height: 8),
@@ -1416,7 +2334,7 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
               ),
               const SizedBox(height: 20),
               StatefulBuilder(
-                builder: (context, setModalState) {
+                builder: (builderContext, setModalState) {
                   return _button(
                     'Enviar Solicitud', 
                     _enviandoSolicitud, 
@@ -1426,8 +2344,9 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
                         return;
                       }
 
+                      bool modalCerrado = false;
                       setModalState(() => _enviandoSolicitud = true);
-                      
+
                       try {
                         final response = await http.post(
                           Uri.parse('$kBaseUrl/solicitudes'),
@@ -1445,24 +2364,32 @@ class _PerfilProfesionalDetalleScreenState extends State<PerfilProfesionalDetall
                         );
 
                         if (response.statusCode == 200) {
+                          _problemaController.clear();
+                          if (modalContext.mounted) {
+                            modalCerrado = true;
+                            Navigator.pop(modalContext); // Cierra el panel
+                          }
+                          // El aviso se muestra con el contexto de la PANTALLA, no el del panel ya cerrado
                           if (mounted) {
-                            Navigator.pop(context); // Cierra modal
                             _snack(context, '¡Solicitud enviada! Espera a que el profesional la acepte.', color: Colors.green);
-                            _problemaController.clear();
                           }
                         } else {
-                          if (mounted) _snack(context, 'Error al enviar la solicitud', color: Colors.red);
+                          if (mounted) _snack(context, _detalleError(response.body), color: Colors.red);
                         }
                       } catch (e) {
                         if (mounted) _snack(context, 'Error de conexión', color: Colors.red);
                       } finally {
-                        setModalState(() => _enviandoSolicitud = false);
+                        _enviandoSolicitud = false;
+                        if (!modalCerrado && modalContext.mounted) {
+                          setModalState(() {});
+                        }
                       }
                     }
                   );
                 }
               ),
             ],
+          ),
           ),
         );
       },
@@ -1867,6 +2794,11 @@ Widget _construirGrid(String nombreUsuario, String subtitulo, List<_ItemMenu> it
                     Text(subtitulo, style: const TextStyle(color: Colors.white70, fontSize: 14)),
                   ],
                 ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.help_outline, color: Colors.white),
+                tooltip: 'Ayuda',
+                onPressed: () {}, // Pendiente: aquí irá la explicación de cada sección
               ),
               IconButton(
                 icon: const Icon(Icons.logout, color: Colors.white),

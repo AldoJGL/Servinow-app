@@ -26,6 +26,15 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>ServiNow necesita conectarse a tu servidor local de desarrollo.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>ServiNow necesita tu ubicacion</string>
 	<key>NSLocationAlwaysUsageDescription</key>
