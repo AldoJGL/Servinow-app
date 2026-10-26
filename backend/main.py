@@ -7,15 +7,17 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import math
+import os
+import re
 from typing import Optional
 
 # 1. Configuración de Supabase
-SUPABASE_URL = "https://gruuoelmqzvjwdcluudz.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdydXVvZWxtcXp2andkY2x1dWR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxOTA1MjIsImV4cCI6MjEwMzc2NjUyMn0.DhV3qJAdYIc5Pt7xzx3qICeFa42F-lXAEuyHSS7o7Jo"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://gruuoelmqzvjwdcluudz.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdydXVvZWxtcXp2andkY2x1dWR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxOTA1MjIsImV4cCI6MjEwMzc2NjUyMn0.DhV3qJAdYIc5Pt7xzx3qICeFa42F-lXAEuyHSS7o7Jo")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # 2. Configuración de Seguridad (JWT y Passlib)
-SECRET_KEY = "super-clave-secreta-de-servinow-cambiar-en-produccion"
+SECRET_KEY = os.getenv("SECRET_KEY", "super-clave-secreta-de-servinow-cambiar-en-produccion")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 horas (con 30 min la app dejaba de recibir mensajes en silencio)
 
@@ -82,10 +84,36 @@ class CrearCotizacion(BaseModel):
 class ResponderCotizacion(BaseModel):
     aceptar: bool
 
+class TerminarTrabajo(BaseModel):
+    nota: Optional[str] = ""      # Qué se hizo (opcional)
+
+class ProponerAjuste(BaseModel):
+    precio: float
+    motivo: str                   # Por qué cambia el precio (obligatorio)
+
+class ResponderAjuste(BaseModel):
+    aceptar: bool
+
+class RechazarCierre(BaseModel):
+    motivo: str                   # Por qué el cliente considera que aún no está terminado
+
+# Estados en los que el chat sigue habilitado
+ESTADOS_CHAT = ("confirmado", "en_curso", "por_verificar", "ajuste_pendiente")
+
 # Flujo de una solicitud:
 #   pendiente -> aceptado -> cotizado -> confirmado   (el chat se habilita en "confirmado")
 #                              |-> cotizacion_rechazada -> (el profesional envía otra) -> cotizado
 #   pendiente -> rechazado
+#
+# Ejecución del trabajo (después de "confirmado"):
+#   confirmado --(profesional inicia)--> en_curso --(profesional termina)--> por_verificar
+#   por_verificar --(cliente confirma y califica)--> completado
+#   por_verificar --(cliente dice que aún no termina)--> en_curso
+#
+# Ajuste de precio (mientras el trabajo está "confirmado" o "en_curso"):
+#   confirmado/en_curso --(profesional propone nuevo precio)--> ajuste_pendiente
+#   ajuste_pendiente --(cliente acepta o rechaza)--> vuelve al estado anterior
+#   (si acepta, el precio de la cotización cambia; si rechaza, se mantiene el original)
 
 # --- FUNCIONES AUXILIARES ---
 def verificar_contrasena(plain_password, hashed_password):
@@ -157,6 +185,69 @@ def verificar_participante(id_solicitud: int, usuario: dict) -> dict:
         raise HTTPException(status_code=403, detail="No participas en esta solicitud")
     return sol
 
+def ahora_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def nombre_corto(nombre: str) -> str:
+    """'María García López' -> 'María G.' (privacidad en las reseñas públicas)."""
+    partes = (nombre or "").strip().split()
+    if not partes:
+        return "Cliente"
+    if len(partes) == 1:
+        return partes[0]
+    return f"{partes[0]} {partes[1][0].upper()}."
+
+def resumen_calificaciones(ids_prof: list) -> dict:
+    """{id_profesional: {'promedio': 4.8, 'total': 12}}. Si la tabla aún no existe, devuelve {}."""
+    resultado = {}
+    if not ids_prof:
+        return resultado
+    try:
+        filas = supabase.table("resenas").select("id_profesional, calificacion").in_("id_profesional", ids_prof).execute().data
+    except Exception:
+        return resultado
+    acumulado = {}
+    for f in filas:
+        a = acumulado.setdefault(f["id_profesional"], [0, 0])
+        a[0] += f["calificacion"]
+        a[1] += 1
+    for id_prof, (suma, total) in acumulado.items():
+        resultado[id_prof] = {"promedio": round(suma / total, 1), "total": total}
+    return resultado
+
+def conteo_completados(ids_prof: list) -> dict:
+    """{id_profesional: trabajos completados}."""
+    conteo = {}
+    if not ids_prof:
+        return conteo
+    try:
+        filas = (
+            supabase.table("solicitudes").select("id_profesional")
+            .in_("id_profesional", ids_prof).eq("estado", "completado").execute().data
+        )
+    except Exception:
+        return conteo
+    for f in filas:
+        conteo[f["id_profesional"]] = conteo.get(f["id_profesional"], 0) + 1
+    return conteo
+
+def parsear_fecha(valor) -> Optional[datetime]:
+    """Convierte fechas ISO de Supabase (con o sin 'Z', con 1 a 6 decimales) a datetime sin zona (UTC)."""
+    if not valor:
+        return None
+    t = str(valor).strip().replace("Z", "+00:00")
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", t)
+    if not m:
+        return None
+    fraccion = (m.group(3) or "")[:7].ljust(7, "0") if m.group(3) else ""
+    try:
+        dt = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}{fraccion}{m.group(4)}")
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = (dt - dt.utcoffset()).replace(tzinfo=None)
+    return dt
+
 def conteo_no_leidos(ids_solicitudes: list, id_usuario) -> dict:
     """Cuenta mensajes no leídos (enviados por la otra persona) agrupados por solicitud."""
     conteo = {}
@@ -184,7 +275,7 @@ def solicitudes_aceptadas_de(usuario: dict) -> list:
             return []
         sols = (
             supabase.table("solicitudes").select(columnas)
-            .eq("id_profesional", id_prof).eq("estado", "confirmado")
+            .eq("id_profesional", id_prof).in_("estado", list(ESTADOS_CHAT))
             .order("id_solicitud", desc=True).execute().data
         )
         # La contraparte es el cliente
@@ -193,7 +284,7 @@ def solicitudes_aceptadas_de(usuario: dict) -> list:
     else:
         sols = (
             supabase.table("solicitudes").select(columnas)
-            .eq("id_cliente", usuario["id_usuario"]).eq("estado", "confirmado")
+            .eq("id_cliente", usuario["id_usuario"]).in_("estado", list(ESTADOS_CHAT))
             .order("id_solicitud", desc=True).execute().data
         )
         # La contraparte es el usuario dueño del perfil profesional
@@ -319,6 +410,17 @@ def obtener_profesionales_cercanos(lat: float, lng: float, radio: float = 15.0, 
                     profesionales_cercanos.append(prof)
 
         profesionales_cercanos.sort(key=lambda x: x["distancia_km"])
+
+        # Calificación promedio y trabajos completados de cada profesional
+        ids = [p["id_profesional"] for p in profesionales_cercanos]
+        resumen = resumen_calificaciones(ids)
+        completados = conteo_completados(ids)
+        for p in profesionales_cercanos:
+            r = resumen.get(p["id_profesional"])
+            p["calificacion_promedio"] = r["promedio"] if r else None
+            p["total_resenas"] = r["total"] if r else 0
+            p["trabajos_completados"] = completados.get(p["id_profesional"], 0)
+
         return {"profesionales": profesionales_cercanos}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al buscar profesionales: {str(e)}")
@@ -336,7 +438,12 @@ def obtener_mi_perfil_profesional(usuario_actual: dict = Depends(obtener_usuario
     ).eq("id_usuario", usuario_actual["id_usuario"]).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="No se encontró el perfil del profesional.")
-    return {"profesional": res.data[0]}
+    prof = res.data[0]
+    r = resumen_calificaciones([prof["id_profesional"]]).get(prof["id_profesional"])
+    prof["calificacion_promedio"] = r["promedio"] if r else None
+    prof["total_resenas"] = r["total"] if r else 0
+    prof["trabajos_completados"] = conteo_completados([prof["id_profesional"]]).get(prof["id_profesional"], 0)
+    return {"profesional": prof}
 
 @app.put("/profesionales/perfil")
 async def actualizar_perfil_profesional(
@@ -543,7 +650,9 @@ def obtener_mis_solicitudes(usuario_actual: dict = Depends(obtener_usuario_actua
     try:
         sols = (
             supabase.table("solicitudes")
-            .select("id_solicitud, descripcion_problema, direccion_texto, estado, precio_cotizacion, detalle_cotizacion, id_profesional")
+            .select("id_solicitud, descripcion_problema, direccion_texto, estado, precio_cotizacion, detalle_cotizacion, id_profesional, "
+                    "fecha_inicio, fecha_fin, fecha_completado, nota_cierre, motivo_rechazo_cierre, "
+                    "precio_propuesto, detalle_propuesto, precio_original, ajuste_respuesta")
             .eq("id_cliente", usuario_actual["id_usuario"])
             .order("id_solicitud", desc=True)
             .limit(50)
@@ -559,15 +668,348 @@ def obtener_mis_solicitudes(usuario_actual: dict = Depends(obtener_usuario_actua
             nombres = {u["id_usuario"]: u["nombre"] for u in users}
             info = {p["id_profesional"]: {"oficio": p.get("oficio", ""), "nombre": nombres.get(p["id_usuario"], "Profesional")} for p in profs}
 
+        # Reseña que el cliente dejó en los trabajos completados
+        resenas = {}
+        ids_completadas = [s["id_solicitud"] for s in sols if s["estado"] == "completado"]
+        if ids_completadas:
+            try:
+                filas = supabase.table("resenas").select("id_solicitud, calificacion, comentario, foto_url").in_("id_solicitud", ids_completadas).execute().data
+                resenas = {f["id_solicitud"]: f for f in filas}
+            except Exception:
+                resenas = {}
+
         for s in sols:
             datos = info.get(s["id_profesional"], {})
             s["nombre_profesional"] = datos.get("nombre", "Profesional")
             s["oficio"] = datos.get("oficio", "")
+            s["resena"] = resenas.get(s["id_solicitud"])
         return {"solicitudes": sols}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al consultar tus solicitudes: {str(e)}")
 
+# --- EJECUCIÓN DEL TRABAJO: iniciar, terminar, verificar y calificar ---
+@app.put("/solicitudes/{id_solicitud}/iniciar")
+def iniciar_trabajo(id_solicitud: int, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """El profesional marca que comenzó el trabajo (solo si el cliente ya aceptó la cotización)."""
+    try:
+        if usuario_actual["rol"] != "Profesional":
+            raise HTTPException(status_code=403, detail="Solo el profesional puede iniciar el trabajo")
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if sol["estado"] != "confirmado":
+            raise HTTPException(status_code=400, detail="Solo puedes iniciar trabajos cuya cotización ya fue aceptada por el cliente")
+
+        response = supabase.table("solicitudes").update({
+            "estado": "en_curso",
+            "fecha_inicio": ahora_iso(),
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "Trabajo iniciado", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al iniciar el trabajo: {str(e)}")
+
+@app.put("/solicitudes/{id_solicitud}/terminar")
+def terminar_trabajo(id_solicitud: int, datos: TerminarTrabajo, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """El profesional marca el trabajo como terminado; queda pendiente de que el cliente lo verifique."""
+    try:
+        if usuario_actual["rol"] != "Profesional":
+            raise HTTPException(status_code=403, detail="Solo el profesional puede marcar el trabajo como terminado")
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if sol["estado"] != "en_curso":
+            raise HTTPException(status_code=400, detail="Solo puedes terminar un trabajo que ya iniciaste")
+
+        response = supabase.table("solicitudes").update({
+            "estado": "por_verificar",
+            "fecha_fin": ahora_iso(),
+            "nota_cierre": (datos.nota or "").strip()[:1000],
+            "motivo_rechazo_cierre": None,
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "Trabajo marcado como terminado. Esperando la verificación del cliente", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al terminar el trabajo: {str(e)}")
+
+@app.put("/solicitudes/{id_solicitud}/ajuste")
+def proponer_ajuste(id_solicitud: int, datos: ProponerAjuste, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """El profesional propone un nuevo precio. El cliente debe aceptarlo para continuar el trabajo."""
+    try:
+        if usuario_actual["rol"] != "Profesional":
+            raise HTTPException(status_code=403, detail="Solo el profesional puede modificar la cotización")
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if sol["estado"] not in ("confirmado", "en_curso"):
+            raise HTTPException(status_code=400, detail="Solo puedes modificar la cotización de un trabajo confirmado o en curso")
+
+        if not math.isfinite(datos.precio) or datos.precio <= 0 or datos.precio > 1_000_000:
+            raise HTTPException(status_code=400, detail="El precio debe ser mayor a 0 y menor o igual a 1,000,000")
+        precio = round(datos.precio, 2)
+        if sol.get("precio_cotizacion") is not None and abs(float(sol["precio_cotizacion"]) - precio) < 0.005:
+            raise HTTPException(status_code=400, detail="El nuevo precio es igual al actual")
+        motivo = (datos.motivo or "").strip()
+        if len(motivo) < 3:
+            raise HTTPException(status_code=400, detail="Explica al cliente por qué cambia el precio")
+
+        response = supabase.table("solicitudes").update({
+            "estado": "ajuste_pendiente",
+            "estado_previo_ajuste": sol["estado"],
+            "precio_propuesto": precio,
+            "detalle_propuesto": motivo[:1000],
+            "precio_original": sol.get("precio_original") if sol.get("precio_original") is not None else sol.get("precio_cotizacion"),
+            "ajuste_respuesta": None,
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "Propuesta enviada. Esperando la respuesta del cliente", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al proponer el ajuste: {str(e)}")
+
+@app.put("/solicitudes/{id_solicitud}/ajuste/respuesta")
+def responder_ajuste(id_solicitud: int, datos: ResponderAjuste, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """El cliente acepta o rechaza el nuevo precio. El trabajo vuelve al estado en que estaba."""
+    try:
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if str(sol["id_cliente"]) != str(usuario_actual["id_usuario"]):
+            raise HTTPException(status_code=403, detail="Solo el cliente puede responder el cambio de precio")
+        if sol["estado"] != "ajuste_pendiente":
+            raise HTTPException(status_code=400, detail="No hay un cambio de precio pendiente de respuesta")
+
+        previo = sol.get("estado_previo_ajuste")
+        if previo not in ("confirmado", "en_curso"):
+            previo = "en_curso" if sol.get("fecha_inicio") else "confirmado"
+
+        cambios = {
+            "estado": previo,
+            "estado_previo_ajuste": None,
+            "ajuste_respuesta": "aceptado" if datos.aceptar else "rechazado",
+        }
+        if datos.aceptar:
+            cambios["precio_cotizacion"] = sol["precio_propuesto"]
+        response = supabase.table("solicitudes").update(cambios).eq("id_solicitud", id_solicitud).execute()
+        return {
+            "mensaje": "Nuevo precio aceptado" if datos.aceptar else "Nuevo precio rechazado. Se mantiene el precio original",
+            "solicitud": response.data[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al responder el cambio de precio: {str(e)}")
+
+@app.put("/solicitudes/{id_solicitud}/cierre-rechazado")
+def rechazar_cierre(id_solicitud: int, datos: RechazarCierre, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """El cliente indica que el trabajo aún no está terminado: vuelve a 'en_curso' con el motivo."""
+    try:
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if str(sol["id_cliente"]) != str(usuario_actual["id_usuario"]):
+            raise HTTPException(status_code=403, detail="Solo el cliente puede verificar el trabajo")
+        if sol["estado"] != "por_verificar":
+            raise HTTPException(status_code=400, detail="El profesional aún no ha marcado el trabajo como terminado")
+
+        motivo = (datos.motivo or "").strip()
+        if len(motivo) < 3:
+            raise HTTPException(status_code=400, detail="Cuéntale al profesional qué falta por terminar")
+
+        response = supabase.table("solicitudes").update({
+            "estado": "en_curso",
+            "motivo_rechazo_cierre": motivo[:1000],
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "Se avisó al profesional que el trabajo aún no está terminado", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al rechazar el cierre: {str(e)}")
+
+@app.post("/solicitudes/{id_solicitud}/resena")
+async def calificar_trabajo(
+    id_solicitud: int,
+    calificacion: int = Form(...),
+    comentario: str = Form(""),
+    foto: Optional[UploadFile] = File(None),
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    """El cliente confirma que el trabajo quedó terminado y lo califica (comentario y foto opcionales)."""
+    try:
+        sol = verificar_participante(id_solicitud, usuario_actual)
+        if str(sol["id_cliente"]) != str(usuario_actual["id_usuario"]):
+            raise HTTPException(status_code=403, detail="Solo el cliente puede calificar el trabajo")
+        if sol["estado"] != "por_verificar":
+            raise HTTPException(status_code=400, detail="El profesional aún no ha marcado el trabajo como terminado, o ya fue calificado")
+        if not (1 <= calificacion <= 5):
+            raise HTTPException(status_code=400, detail="La calificación debe ser de 1 a 5 estrellas")
+
+        foto_url = ""
+        if foto and foto.filename:
+            extension = foto.filename.rsplit(".", 1)[-1].lower() if "." in foto.filename else "jpg"
+            if extension not in ("jpg", "jpeg", "png", "webp"):
+                raise HTTPException(status_code=400, detail="La foto debe ser JPG, PNG o WEBP")
+            contenido = await foto.read()
+            if len(contenido) > 5 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="La foto no puede pesar más de 5 MB")
+            nombre_archivo = f"resenas/solicitud_{id_solicitud}.{extension}"
+            supabase.storage.from_("trabajos").upload(
+                path=nombre_archivo,
+                file=contenido,
+                file_options={"content-type": foto.content_type or "image/jpeg", "upsert": "true"},
+            )
+            foto_url = supabase.storage.from_("trabajos").get_public_url(nombre_archivo)
+
+        # upsert: si un intento anterior guardó la reseña pero falló al cerrar el trabajo, se puede reintentar
+        supabase.table("resenas").upsert({
+            "id_solicitud": id_solicitud,
+            "id_cliente": sol["id_cliente"],
+            "id_profesional": sol["id_profesional"],
+            "calificacion": calificacion,
+            "comentario": (comentario or "").strip()[:1000],
+            "foto_url": foto_url,
+        }, on_conflict="id_solicitud").execute()
+
+        response = supabase.table("solicitudes").update({
+            "estado": "completado",
+            "fecha_completado": ahora_iso(),
+        }).eq("id_solicitud", id_solicitud).execute()
+        return {"mensaje": "¡Gracias! Trabajo confirmado y calificado", "solicitud": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al calificar el trabajo: {str(e)}")
+
+@app.get("/solicitudes/{id_solicitud}/resena")
+def obtener_resena(id_solicitud: int, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """Reseña de un trabajo (la pueden ver el cliente y el profesional de esa solicitud)."""
+    try:
+        verificar_participante(id_solicitud, usuario_actual)
+        res = supabase.table("resenas").select("*").eq("id_solicitud", id_solicitud).execute()
+        return {"resena": res.data[0] if res.data else None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al consultar la reseña: {str(e)}")
+
+@app.get("/profesionales/ganancias")
+def ganancias_profesional(usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """Resumen de ganancias del profesional: solo cuentan los trabajos completados (verificados por el cliente)."""
+    try:
+        if usuario_actual["rol"] != "Profesional":
+            raise HTTPException(status_code=403, detail="Solo los profesionales tienen ganancias")
+        id_profesional = obtener_id_profesional(usuario_actual["id_usuario"])
+        if id_profesional is None:
+            raise HTTPException(status_code=404, detail="Perfil profesional no encontrado")
+
+        filas = (
+            supabase.table("solicitudes")
+            .select("id_solicitud, descripcion_problema, precio_cotizacion, fecha_inicio, fecha_fin, fecha_completado, usuarios!id_cliente(nombre)")
+            .eq("id_profesional", id_profesional)
+            .eq("estado", "completado")
+            .order("fecha_completado", desc=True)
+            .execute().data
+        )
+
+        total = 0.0
+        segundos_totales = 0
+        trabajos = []
+        for f in filas:
+            precio = float(f.get("precio_cotizacion") or 0)
+            ini, fin = parsear_fecha(f.get("fecha_inicio")), parsear_fecha(f.get("fecha_fin"))
+            segundos = int((fin - ini).total_seconds()) if ini and fin and fin > ini else 0
+            total += precio
+            segundos_totales += segundos
+            trabajos.append({
+                "id_solicitud": f["id_solicitud"],
+                "descripcion_problema": f.get("descripcion_problema") or "",
+                "cliente": (f.get("usuarios") or {}).get("nombre", "Cliente"),
+                "monto": round(precio, 2),
+                "segundos_trabajados": segundos,
+                "fecha_completado": f.get("fecha_completado"),
+            })
+
+        return {
+            "resumen": {
+                "total_ganado": round(total, 2),
+                "trabajos_completados": len(trabajos),
+                "segundos_trabajados": segundos_totales,
+            },
+            "trabajos": trabajos,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al consultar las ganancias: {str(e)}")
+
+@app.get("/profesionales/{id_profesional}/resenas")
+def resenas_de_profesional(id_profesional: str, usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """Reseñas públicas de un profesional (nombre del cliente abreviado) y su calificación promedio."""
+    try:
+        resumen = resumen_calificaciones([id_profesional]).get(id_profesional, {"promedio": None, "total": 0})
+        completados = conteo_completados([id_profesional]).get(id_profesional, 0)
+
+        filas = (
+            supabase.table("resenas")
+            .select("id_resena, id_cliente, calificacion, comentario, foto_url, fecha_creacion")
+            .eq("id_profesional", id_profesional)
+            .order("id_resena", desc=True)
+            .limit(30)
+            .execute().data
+        )
+        ids_clientes = list({f["id_cliente"] for f in filas})
+        nombres = {}
+        if ids_clientes:
+            users = supabase.table("usuarios").select("id_usuario, nombre").in_("id_usuario", ids_clientes).execute().data
+            nombres = {u["id_usuario"]: u["nombre"] for u in users}
+
+        resenas = [{
+            "calificacion": f["calificacion"],
+            "comentario": f.get("comentario") or "",
+            "foto_url": f.get("foto_url") or "",
+            "fecha_creacion": f.get("fecha_creacion"),
+            "nombre_cliente": nombre_corto(nombres.get(f["id_cliente"], "")),
+        } for f in filas]
+
+        return {
+            "resumen": {"promedio": resumen["promedio"], "total": resumen["total"], "trabajos_completados": completados},
+            "resenas": resenas,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al consultar las reseñas: {str(e)}")
+
+@app.get("/solicitudes/trabajos")
+def obtener_trabajos_profesional(usuario_actual: dict = Depends(obtener_usuario_actual)):
+    """Trabajos del profesional ya confirmados por el cliente (por iniciar, en curso, por verificar y completados)."""
+    try:
+        id_profesional = obtener_id_profesional(usuario_actual["id_usuario"])
+        if id_profesional is None:
+            raise HTTPException(status_code=404, detail="Perfil profesional no encontrado")
+
+        trabajos = (
+            supabase.table("solicitudes").select(
+                "id_solicitud, descripcion_problema, direccion_texto, latitud, longitud, estado, fecha_creacion, "
+                "precio_cotizacion, detalle_cotizacion, fecha_inicio, fecha_fin, fecha_completado, nota_cierre, "
+                "motivo_rechazo_cierre, precio_propuesto, detalle_propuesto, precio_original, ajuste_respuesta, usuarios!id_cliente(nombre, telefono)"
+            )
+            .eq("id_profesional", id_profesional)
+            .in_("estado", ["confirmado", "en_curso", "por_verificar", "ajuste_pendiente", "completado"])
+            .order("id_solicitud", desc=True)
+            .limit(100)
+            .execute().data
+        )
+
+        resenas = {}
+        ids_completados = [t["id_solicitud"] for t in trabajos if t["estado"] == "completado"]
+        if ids_completados:
+            try:
+                filas = supabase.table("resenas").select("id_solicitud, calificacion, comentario, foto_url").in_("id_solicitud", ids_completados).execute().data
+                resenas = {f["id_solicitud"]: f for f in filas}
+            except Exception:
+                resenas = {}
+        for t in trabajos:
+            t["resena"] = resenas.get(t["id_solicitud"])
+
+        return {"solicitudes": trabajos}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al consultar tus trabajos: {str(e)}")
+
 # --- NOTIFICACIONES (círculos rojos) ---
+
 @app.get("/notificaciones/resumen")
 def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual)):
     try:
@@ -595,10 +1037,42 @@ def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual
             )
             cotizaciones_pendientes = len(cot.data)
 
+        # Trabajos terminados por el profesional que el cliente aún debe verificar
+        cierres_pendientes = 0
+        if usuario_actual["rol"] != "Profesional":
+            cier = (
+                supabase.table("solicitudes").select("id_solicitud")
+                .eq("id_cliente", usuario_actual["id_usuario"]).eq("estado", "por_verificar").execute()
+            )
+            cierres_pendientes = len(cier.data)
+
+        # Cambios de precio propuestos por el profesional que el cliente debe responder
+        ajustes_pendientes = 0
+        if usuario_actual["rol"] != "Profesional":
+            aj = (
+                supabase.table("solicitudes").select("id_solicitud")
+                .eq("id_cliente", usuario_actual["id_usuario"]).eq("estado", "ajuste_pendiente").execute()
+            )
+            ajustes_pendientes = len(aj.data)
+
+        # Trabajos confirmados que el profesional todavía no inicia
+        trabajos_por_iniciar = 0
+        if usuario_actual["rol"] == "Profesional":
+            id_prof = obtener_id_profesional(usuario_actual["id_usuario"])
+            if id_prof is not None:
+                ini = (
+                    supabase.table("solicitudes").select("id_solicitud")
+                    .eq("id_profesional", id_prof).eq("estado", "confirmado").execute()
+                )
+                trabajos_por_iniciar = len(ini.data)
+
         return {
             "mensajes_sin_leer": mensajes_sin_leer,
             "solicitudes_pendientes": solicitudes_pendientes,
             "cotizaciones_pendientes": cotizaciones_pendientes,
+            "cierres_pendientes": cierres_pendientes,
+            "ajustes_pendientes": ajustes_pendientes,
+            "trabajos_por_iniciar": trabajos_por_iniciar,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al consultar notificaciones: {str(e)}")
@@ -608,8 +1082,8 @@ def resumen_notificaciones(usuario_actual: dict = Depends(obtener_usuario_actual
 def enviar_mensaje(id_solicitud: int, mensaje: CrearMensaje, usuario_actual: dict = Depends(obtener_usuario_actual)):
     try:
         sol = verificar_participante(id_solicitud, usuario_actual)
-        if sol["estado"] != "confirmado":
-            raise HTTPException(status_code=403, detail="El chat se habilita cuando el cliente acepta la cotización")
+        if sol["estado"] not in ESTADOS_CHAT:
+            raise HTTPException(status_code=403, detail="El chat está disponible mientras el trabajo está activo (desde que el cliente acepta la cotización)")
 
         contenido = mensaje.contenido.strip()
         if not contenido:
