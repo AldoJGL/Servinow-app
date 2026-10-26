@@ -21,7 +21,7 @@ const kBg = Color(0xFFF6F7FB);
 const kGray = Color(0xFF8A8A9E);
 
 // Dirección del servidor. Se cambia al compilar: flutter build apk --release --dart-define=API_URL=https://tu-servidor.onrender.com
-const kBaseUrl = String.fromEnvironment('API_URL', defaultValue: 'http://192.168.1.111:8000');
+const kBaseUrl = String.fromEnvironment('API_URL', defaultValue: 'https://servinow-l8sx.onrender.com');
 
 String _detalleError(String body) {
   try {
